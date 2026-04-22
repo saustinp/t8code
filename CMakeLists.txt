@@ -66,6 +66,8 @@ option( T8CODE_BUILD_FORTRAN_INTERFACE "Build t8code's Fortran interface" OFF )
 option( T8CODE_ENABLE_MPI "Enable t8code's features which rely on MPI" ON )
 option( T8CODE_ENABLE_VTK "Enable t8code's features which rely on VTK" OFF )
 option( T8CODE_ENABLE_OCC "Enable t8code's features which rely on OpenCASCADE" OFF )
+option( T8_ENABLE_METIS "Enable t8code's features which rely on METIS" OFF )
+option( T8CODE_ENABLE_GMSH "Enable reading gmsh physical groups via the gmsh API" OFF )
 
 option( T8CODE_USE_SYSTEM_SC "Use system-installed sc library" OFF )
 option( T8CODE_USE_SYSTEM_P4EST "Use system-installed p4est library" OFF )
@@ -155,6 +157,37 @@ if( T8CODE_ENABLE_OCC )
         message("Found OpenCASCADE")
     endif (OpenCASCADE_FOUND)
 endif( T8CODE_ENABLE_OCC )
+
+if(T8_ENABLE_METIS)
+    # 1. Look for the header file
+    find_path(METIS_INCLUDE_DIR NAMES metis.h
+              PATHS /home/sam/.local/include /usr/local/include /usr/include)
+
+    # 2. Look for the actual library file (libmetis.a)
+    find_library(METIS_LIBRARY NAMES metis
+                 PATHS /home/sam/.local/lib /usr/local/lib /usr/lib)
+
+    # 3. GKlib is METIS's internal utility library; built from source it is separate
+    find_library(GKLIB_LIBRARY NAMES GKlib
+                 PATHS /home/sam/.local/lib /usr/local/lib /usr/lib)
+
+    if(METIS_INCLUDE_DIR AND METIS_LIBRARY)
+        message(STATUS "Found METIS: ${METIS_LIBRARY}")
+        if(GKLIB_LIBRARY)
+            message(STATUS "Found GKlib: ${GKLIB_LIBRARY}")
+        endif()
+    else()
+        message(FATAL_ERROR "METIS enabled but not found. Check CMAKE_PREFIX_PATH.")
+    endif()
+endif()
+
+if( T8CODE_ENABLE_GMSH )
+    find_package( gmsh REQUIRED
+        HINTS /home/sam/.local/gmsh/share/gmsh )
+    if( gmsh_FOUND )
+        message( STATUS "Found gmsh: ${gmsh_DIR}" )
+    endif()
+endif( T8CODE_ENABLE_GMSH )
 
 # Override default for this libsc option
 set( BUILD_SHARED_LIBS ON CACHE BOOL "Build libsc as a shared library" )
@@ -270,23 +303,25 @@ else()
     mark_as_advanced( FORCE ${_new_p4est_vars} )
 endif()
 
-# Workaround: Suppress warnings for googletests, so it does not compromise the usage of -WError for t8code.
-# -----------
-# 1. Save original flags
-set(ORIGINAL_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
-set(ORIGINAL_C_FLAGS   "${CMAKE_C_FLAGS}")
+if( T8CODE_BUILD_TESTS )
+  # Workaround: Suppress warnings for googletests, so it does not compromise the usage of -WError for t8code.
+  # -----------
+  # 1. Save original flags
+  set(ORIGINAL_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+  set(ORIGINAL_C_FLAGS   "${CMAKE_C_FLAGS}")
 
-# 2. Suppress warnings for GoogleTest build
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -w" CACHE STRING "" FORCE)
-set(CMAKE_C_FLAGS   "${CMAKE_C_FLAGS}   -w" CACHE STRING "" FORCE)
+  # 2. Suppress warnings for GoogleTest build
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -w" CACHE STRING "" FORCE)
+  set(CMAKE_C_FLAGS   "${CMAKE_C_FLAGS}   -w" CACHE STRING "" FORCE)
 
-FetchContent_MakeAvailable( googletest )
+  FetchContent_MakeAvailable( googletest )
 
-# 3. Restore original flags
-set(CMAKE_CXX_FLAGS "${ORIGINAL_CXX_FLAGS}" CACHE STRING "" FORCE)
-set(CMAKE_C_FLAGS   "${ORIGINAL_C_FLAGS}"   CACHE STRING "" FORCE)
+  # 3. Restore original flags
+  set(CMAKE_CXX_FLAGS "${ORIGINAL_CXX_FLAGS}" CACHE STRING "" FORCE)
+  set(CMAKE_C_FLAGS   "${ORIGINAL_C_FLAGS}"   CACHE STRING "" FORCE)
 
-# End of workaround
+  # End of workaround
+endif()
 
 add_subdirectory( ${CMAKE_CURRENT_LIST_DIR}/src )
 
@@ -321,5 +356,7 @@ if( T8CODE_BUILD_FORTRAN_INTERFACE )
         message( FATAL_ERROR "Fortran API only available when MPI is enabled." )
     endif()
 endif()
+
+# add_subdirectory( ${CMAKE_CURRENT_LIST_DIR}/user_work )
 
 include (cmake/CPackConfig.cmake)

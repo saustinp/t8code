@@ -123,4 +123,34 @@ t8_cmesh_register_geometry (t8_cmesh_t cmesh, _args &&...args)
 const tree_vertex_list &
 t8_cmesh_get_vertex_to_tree_list (const t8_cmesh_t cmesh, const t8_gloidx_t global_vertex);
 
+/* -----------------------------------------------------------------------
+ * Physical group accessors (populated when T8CODE_ENABLE_GMSH is ON
+ * and the .msh file contains physical groups; empty otherwise).
+ * -----------------------------------------------------------------------*/
+
+/** Get the physical groups map (name -> PhysicalGroup). */
+inline const std::map<std::string, PhysicalGroup> &
+t8_cmesh_get_physical_groups (const t8_cmesh_t cmesh)
+{
+  T8_ASSERT (cmesh != NULL);
+  return cmesh->physical_groups;
+}
+
+/** Get the boundary group name table (groups with dim == max_dim - 1). */
+inline const std::vector<std::string> &
+t8_cmesh_get_boundary_table (const t8_cmesh_t cmesh)
+{
+  T8_ASSERT (cmesh != NULL);
+  return cmesh->bdry_table;
+}
+
+/** Get the entity-to-physical-group reverse lookup.
+ *  entity_to_pg[entity_id] = PG tag, or -1 if not in any boundary group. */
+inline const std::vector<int> &
+t8_cmesh_get_entity_to_pg (const t8_cmesh_t cmesh)
+{
+  T8_ASSERT (cmesh != NULL);
+  return cmesh->entity_to_pg;
+}
+
 #endif /* T8_CMESH_HXX */

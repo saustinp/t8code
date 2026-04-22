@@ -220,6 +220,14 @@ t8_cmesh_init (t8_cmesh_t *pcmesh)
    * or when the cmesh gets committed. */
   cmesh->geometry_handler = NULL;
   cmesh->vertex_connectivity = new t8_cmesh_vertex_connectivity ();
+
+  /* Placement-new for C++ members: T8_ALLOC_ZERO uses sc_calloc which does
+   * not call constructors.  These three containers must be properly constructed
+   * so that operations like push_back / operator[] are safe. */
+  new (&cmesh->physical_groups) std::map<std::string, PhysicalGroup> ();
+  new (&cmesh->bdry_table) std::vector<std::string> ();
+  new (&cmesh->entity_to_pg) std::vector<int> ();
+
 #if T8_ENABLE_DEBUG
   cmesh->negative_volume_check = 1;
 #endif /* T8_ENABLE_DEBUG */
@@ -1225,6 +1233,12 @@ t8_cmesh_reset (t8_cmesh_t *pcmesh)
   if (cmesh->vertex_connectivity != NULL) {
     delete cmesh->vertex_connectivity;
   }
+
+  /* Explicitly destroy C++ members before T8_FREE (which uses sc_free and
+   * does not call destructors).  Must match the placement-new in t8_cmesh_init. */
+  cmesh->physical_groups.~map ();
+  cmesh->bdry_table.~vector ();
+  cmesh->entity_to_pg.~vector ();
 
   T8_FREE (cmesh);
   *pcmesh = NULL;

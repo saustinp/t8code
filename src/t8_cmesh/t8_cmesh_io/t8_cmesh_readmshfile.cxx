@@ -38,6 +38,11 @@
 #include <optional>
 #include <vector>
 #include <array>
+#include <string>
+#include <map>
+#if T8_ENABLE_GMSH
+#include <gmsh.h>
+#endif
 
 #ifdef _WIN32
 #include <t8_misc/t8_windows.h>
@@ -1691,6 +1696,56 @@ t8_cmesh_from_msh_file_register_geometries (t8_cmesh_t cmesh, const int use_cad_
   return 1;
 }
 
+#if T8_ENABLE_GMSH
+static void
+read_gmsh_physical_groups (t8_cmesh_t cmesh, const std::string &fname)
+{
+  gmsh::initialize ();
+  gmsh::merge (fname);
+
+  gmsh::vectorpair dimTags;
+  gmsh::model::getPhysicalGroups (dimTags);
+
+  if (!dimTags.empty ()) {
+    int max_dim = 0;
+    for (const auto &[dim, tag] : dimTags)
+      max_dim = std::max (max_dim, dim);
+
+    for (const auto &[dim, tag] : dimTags) {
+      PhysicalGroup pg;
+      pg.dim = dim;
+      pg.tag = tag;
+
+      gmsh::model::getPhysicalName (dim, tag, pg.name);
+      gmsh::model::getEntitiesForPhysicalGroup (dim, tag, pg.entities);
+      
+
+      if (dim == max_dim - 1)
+        cmesh->bdry_table.push_back (pg.name);
+
+      cmesh->physical_groups[pg.name] = std::move (pg);
+    }
+
+    /* Build reverse lookup: entity_id -> physical group tag */
+    int max_entity_id = 0;
+    for (const auto &[name, pg] : cmesh->physical_groups)
+      if (pg.dim == max_dim - 1)
+        for (int e : pg.entities)
+          max_entity_id = std::max (max_entity_id, e);
+
+    cmesh->entity_to_pg.assign (max_entity_id + 1, -1);
+    for (const auto &[name, pg] : cmesh->physical_groups)
+      if (pg.dim == max_dim - 1)
+        for (int e : pg.entities)
+          cmesh->entity_to_pg[e] = pg.tag;
+  } else {
+    t8_debugf("No physical groups found in the mesh file.");
+  }
+
+  gmsh::finalize ();
+}
+#endif /* T8_ENABLE_GMSH */
+
 t8_cmesh_t
 t8_cmesh_from_msh_file (const char *fileprefix, const int partition, sc_MPI_Comm comm, const int dim,
                         const int main_proc, const int use_cad_geometry)
@@ -1838,6 +1893,12 @@ t8_cmesh_from_msh_file (const char *fileprefix, const int partition, sc_MPI_Comm
     t8_cmesh_set_partition_range (cmesh, 3, first_tree, last_tree);
   }
 
+#if T8_ENABLE_GMSH
+  /* Load physical groups into the cmesh.  This runs on all processes,
+   * which is fine — it is neither memory- nor compute-intensive. */
+  read_gmsh_physical_groups (cmesh, current_file);
+#endif
+  
   /* Commit the cmesh */
   T8_ASSERT (cmesh != NULL);
   if (cmesh != NULL) {

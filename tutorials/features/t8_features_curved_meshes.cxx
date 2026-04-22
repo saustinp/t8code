@@ -38,7 +38,13 @@
 #include <t8.h>                                        /* General t8code header, always include this. */
 #include <sc_options.h>                                /* CLI parser */
 #include <t8_cmesh/t8_cmesh.h>                         /* cmesh definition and basic interface. */
-#include <t8_cmesh/t8_cmesh_internal/t8_cmesh_types.h> /* For the attribute keys.  */
+#include <t8_eclass/t8_eclass.h>                        /* For T8_ECLASS_MAX_EDGES, needed for attribute keys below. */
+/* Workaround: these constants are defined in the non-installed internal header
+ * t8_cmesh/t8_cmesh_internal/t8_cmesh_types.h. They should be exposed in a
+ * public header (e.g. t8_cmesh_cad.hxx). See https://github.com/DLR-AMR/t8code/pull/1986 */
+#define T8_CMESH_CAD_EDGE_ATTRIBUTE_KEY            5
+#define T8_CMESH_CAD_EDGE_PARAMETERS_ATTRIBUTE_KEY 6
+#define T8_CMESH_CAD_FACE_ATTRIBUTE_KEY            (T8_CMESH_CAD_EDGE_PARAMETERS_ATTRIBUTE_KEY + T8_ECLASS_MAX_EDGES)
 #include <t8_forest/t8_forest_general.h>               /* forest definition and basic interface. */
 #include <t8_forest/t8_forest_io.h>                    /* save forest */
 #include <t8_forest/t8_forest_geometrical.h>           /* geometrical information of the forest */

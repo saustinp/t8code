@@ -90,6 +90,21 @@ if( T8CODE_ENABLE_VTK )
     )
 endif()
 
+if( T8_ENABLE_METIS )
+    target_compile_definitions( T8 PUBLIC T8_ENABLE_METIS=1 )
+    target_include_directories( T8 PUBLIC ${METIS_INCLUDE_DIR} )
+    target_link_libraries( T8 PUBLIC ${METIS_LIBRARY} )
+    if( GKLIB_LIBRARY )
+        target_link_libraries( T8 PUBLIC ${GKLIB_LIBRARY} )
+    endif()
+endif()
+
+if( T8CODE_ENABLE_GMSH )
+    target_compile_definitions( T8 PUBLIC T8_ENABLE_GMSH=1 )
+    target_include_directories( T8 PUBLIC /home/sam/.local/gmsh/include )
+    target_link_libraries( T8 PUBLIC /home/sam/.local/gmsh/lib/libgmsh.so )
+endif()
+
 if( T8CODE_ENABLE_OCC )
     target_compile_definitions( T8 PUBLIC T8_ENABLE_OCC=1 )
     target_include_directories( T8 SYSTEM PUBLIC ${OpenCASCADE_INCLUDE_DIR} )
@@ -239,7 +254,7 @@ install( FILES
 # See https://gitlab.kitware.com/cmake/cmake/-/issues/19189
 
 install( DIRECTORY t8_helper_functions 
-  DESTINATION PRIVATE_HEADER 
+  DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} 
   FILES_MATCHING 
     PATTERN "*.h" 
     PATTERN "*.hxx" 
@@ -253,7 +268,15 @@ install( DIRECTORY t8_cmesh
     PATTERN "t8_cmesh/t8_cmesh_vertex_connectivity/t8_cmesh_vertex_connectivity.hxx" EXCLUDE
     PATTERN "t8_cmesh/t8_cmesh_vertex_connectivity/t8_cmesh_vertex_conn_*.hxx" EXCLUDE
 )
-install( DIRECTORY t8_data 
+# t8_cmesh_types.h is needed by the public header t8_cmesh.hxx (for PhysicalGroup
+# and the C++ members of t8_cmesh).  The bulk EXCLUDE above hides all internal
+# headers, so we install this one explicitly.
+install( FILES
+  t8_cmesh/t8_cmesh_internal/t8_cmesh_types.h
+  t8_cmesh/t8_cmesh_internal/t8_cmesh_stash.h
+  DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/t8_cmesh/t8_cmesh_internal
+)
+install( DIRECTORY t8_data
   DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} 
   FILES_MATCHING 
     PATTERN "*.h"

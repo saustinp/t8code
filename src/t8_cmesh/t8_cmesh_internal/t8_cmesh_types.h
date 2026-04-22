@@ -34,6 +34,11 @@
 #include <t8_cmesh/t8_cmesh_vertex_connectivity/t8_cmesh_vertex_connectivity.h>
 #include <t8_cmesh/t8_cmesh_internal/t8_cmesh_stash.h>
 #include <t8_element/t8_element.h>
+#ifdef __cplusplus
+#include <vector>
+#include <string>
+#include <map>
+#endif
 
 /** Opaque pointer to a t8_part_tree */
 typedef struct t8_part_tree *t8_part_tree_t;
@@ -88,6 +93,17 @@ typedef struct t8_cprofile t8_cprofile_t; /* Defined below */
  *  by an array. The hash value of a ghost tree is its tree_id modulo the number
  *  of ghosts on this process.
  */
+
+#ifdef __cplusplus
+// struct to hold the physical groups in the mesh
+struct PhysicalGroup {
+  int dim;
+  int tag;
+  std::string name;
+  std::vector<int> entities; // model entity tags belonging to this physGrps
+};
+#endif
+
 typedef struct t8_cmesh
 {
   /* TODO: make the comments more legible */
@@ -152,6 +168,13 @@ typedef struct t8_cmesh
 #endif
   t8_stash_t stash;       /**< Used as temporary storage for the trees before commit. */
   t8_cprofile_t *profile; /**< Used to measure runtimes and statistics of the cmesh algorithms. */
+
+#ifdef __cplusplus
+  std::map<std::string, PhysicalGroup> physical_groups;  // name -> physical group
+  std::vector<std::string> bdry_table;            // boundary group names
+  std::vector<int> entity_to_pg;                  // entity_id -> PG tag (-1 = none)
+#endif
+
 } t8_cmesh_struct_t;
 
 /* TODO: cghost could be the same type as ctree.
