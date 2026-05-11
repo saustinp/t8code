@@ -256,18 +256,30 @@ t8_geometry_cad::t8_geom_evaluate_cad_tri (t8_cmesh_t cmesh, t8_gloidx_t gtreeid
             scaled_displacement = displacement * scaling_factor;
             interpolated_surface_parameters[dim + offset_2d] += scaled_displacement;
           }
-
-          pnt = process_surface (edges[i_edge + num_edges], interpolated_surface_parameters + offset_2d);
-
-          for (int dim = 0; dim < 3; ++dim) {
-            out_coords[dim + offset_3d] = pnt.Coord (dim + 1);
-          }
         }
       }
-      pnt = process_surface (*faces, interpolated_surface_parameters);
-
+    }
+    /* After accumulating per-edge surface-parameter displacements into
+     * interpolated_surface_parameters for every ref coord, evaluate the
+     * face's surface at the accumulated (u,v) params to produce the final
+     * 3D point per coord.
+     *
+     * The previous structure had two defects here:
+     *   (A) inside the i_coord loop above, a process_surface call dereferenced
+     *       edges[i_edge + num_edges], which is 0 in 2D because face linkage
+     *       in readmshfile locks that slot. OCC's IndexedMap::FindKey(0) then
+     *       raised Standard_OutOfRange.
+     *   (B) the per-coord final eval used to live outside the i_coord loop
+     *       but inside the outer i_edge loop, and only wrote out_coords[0..2],
+     *       silently breaking batch evaluation for num_coords > 1.
+     * See notes/plan_t8code_cad_evaluator_followup.md (defects A and B) for
+     * the full diagnostic. */
+    for (size_t i_coord = 0; i_coord < num_coords; ++i_coord) {
+      const int offset_2d = i_coord * 2;
+      const int offset_3d = i_coord * 3;
+      pnt = process_surface (*faces, interpolated_surface_parameters + offset_2d);
       for (int dim = 0; dim < 3; ++dim) {
-        out_coords[dim] = pnt.Coord (dim + 1);
+        out_coords[dim + offset_3d] = pnt.Coord (dim + 1);
       }
     }
   }
