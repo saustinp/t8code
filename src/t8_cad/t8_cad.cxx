@@ -29,11 +29,16 @@
 #include <BRepTools.hxx>
 #include <GeomAPI_ProjectPointOnSurf.hxx>
 #include <GeomAPI_ProjectPointOnCurve.hxx>
+#include <Geom_BSplineCurve.hxx>
+#include <Geom_BSplineSurface.hxx>
 #include <TopoDS_Edge.hxx>
 #include <TopoDS_Face.hxx>
 #include <Standard_Version.hxx>
 #include <ShapeAnalysis_Edge.hxx>
 #include <TopExp_Explorer.hxx>
+#include <gp_Vec.hxx>
+#include <algorithm>
+#include <cmath>
 
 #if T8_ENABLE_DEBUG
 #include <Precision.hxx>
@@ -84,7 +89,28 @@ t8_cad::t8_geom_is_line (const int curve_index) const
 {
   const Handle_Geom_Curve curve = t8_geom_get_cad_curve (curve_index);
   const GeomAdaptor_Curve curve_adaptor (curve);
-  return curve_adaptor.GetType () == GeomAbs_Line;
+  if (curve_adaptor.GetType () == GeomAbs_Line) {
+    return 1;
+  }
+  /* Also recognize the specific BSpline encoding produced by OCC's
+   * BRepBuilderAPI_GTransform pipeline when gmsh's occ.dilate /
+   * occ.symmetry / occ.affine operations promote a primitive Geom_Line
+   * to a BSpline basis: degree 1, non-rational, 2 poles. Geometrically
+   * bit-exact a line — the two poles ARE the endpoints. Without this
+   * recognition, t8code's readmshfile would route such edges through the
+   * curved-edge linkage path and do redundant work for geometrically
+   * straight edges. See notes/plan_t8code_cad_evaluator_followup.md
+   * (defect C). */
+  if (curve_adaptor.GetType () == GeomAbs_BSplineCurve) {
+    const Handle_Geom_BSplineCurve bs = curve_adaptor.BSpline ();
+    if (!bs.IsNull ()
+        && bs->Degree () == 1
+        && bs->NbPoles () == 2
+        && !bs->IsRational ()) {
+      return 1;
+    }
+  }
+  return 0;
 }
 
 int
@@ -92,7 +118,43 @@ t8_cad::t8_geom_is_plane (const int surface_index) const
 {
   const Handle_Geom_Surface surface = t8_geom_get_cad_surface (surface_index);
   const GeomAdaptor_Surface surface_adaptor (surface);
-  return surface_adaptor.GetType () == GeomAbs_Plane;
+  if (surface_adaptor.GetType () == GeomAbs_Plane) {
+    return 1;
+  }
+  /* Also recognize the BSpline-surface encoding that BRepBuilderAPI_GTransform
+   * produces from a Geom_Plane: degree 1 × degree 1, non-rational, 2×2
+   * control net with coplanar control points. A 2×2 deg-1×1 BSpline surface
+   * is a bilinear patch — geometrically a plane iff its 4 corners are
+   * coplanar. (Non-coplanar corners give a hyperbolic paraboloid, which
+   * IS genuinely curved.) Same rationale as the line case above. */
+  if (surface_adaptor.GetType () == GeomAbs_BSplineSurface) {
+    const Handle_Geom_BSplineSurface bs = surface_adaptor.BSpline ();
+    if (bs.IsNull ()
+        || bs->UDegree () != 1 || bs->VDegree () != 1
+        || bs->NbUPoles () != 2 || bs->NbVPoles () != 2
+        || bs->IsURational () || bs->IsVRational ()) {
+      return 0;
+    }
+    const gp_Pnt p00 = bs->Pole (1, 1);
+    const gp_Pnt p10 = bs->Pole (2, 1);
+    const gp_Pnt p01 = bs->Pole (1, 2);
+    const gp_Pnt p11 = bs->Pole (2, 2);
+    const gp_Vec v10 (p00, p10);
+    const gp_Vec v01 (p00, p01);
+    const gp_Vec v11 (p00, p11);
+    const gp_Vec n = v10.Crossed (v01);
+    const double nlen = n.Magnitude ();
+    if (nlen < 1e-30) {
+      return 0;  /* degenerate control polygon */
+    }
+    const double d = std::abs (v11.Dot (n)) / nlen;
+    const double extent = std::max ({v10.Magnitude (),
+                                      v01.Magnitude (),
+                                      v11.Magnitude ()});
+    const double tol_abs = std::max (1e-9, extent * 1e-9);
+    return d <= tol_abs ? 1 : 0;
+  }
+  return 0;
 }
 
 const TopoDS_Vertex
