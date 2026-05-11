@@ -114,9 +114,19 @@ t8_cmesh_is_committed (const t8_cmesh_t cmesh)
 
 #if T8_ENABLE_DEBUG
     /* TODO: check more conditions that must always hold after commit */
-    if ((!t8_cmesh_trees_is_face_consistent (cmesh, cmesh->trees)) || (!t8_cmesh_check_trees_per_eclass (cmesh))) {
-      is_checking = 0;
-      return 0;
+    /* The face-consistency check is O(n_trees * n_faces). is_committed is
+     * called O(n_trees) times during cmesh commit (from inside get_attribute
+     * lookups via build_vertex_to_tree), so without the cache the commit
+     * itself becomes O(n_trees^2) and hangs for minutes on ~6k-element
+     * meshes. Since the cmesh is immutable post-commit, we only need to
+     * verify consistency once; cache the result on the cmesh. See
+     * notes/plan_t8code_cad_evaluator_followup.md (defect D). */
+    if (!cmesh->debug_validated) {
+      if ((!t8_cmesh_trees_is_face_consistent (cmesh, cmesh->trees)) || (!t8_cmesh_check_trees_per_eclass (cmesh))) {
+        is_checking = 0;
+        return 0;
+      }
+      cmesh->debug_validated = 1;
     }
     if (t8_cmesh_get_num_local_trees (cmesh) > 0 && t8_cmesh_is_empty (cmesh)) {
       is_checking = 0;

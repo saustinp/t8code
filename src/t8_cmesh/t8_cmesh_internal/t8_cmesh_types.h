@@ -165,6 +165,17 @@ typedef struct t8_cmesh
                                            check at commit if it equals the total number. */
   t8_locidx_t inserted_ghosts; /**< Count the number of inserted ghosts to
                                            check at commit if it equals the total number. */
+  /* Cache for the expensive face-consistency check inside t8_cmesh_is_committed.
+   * Zero (the zero-initialized default from T8_ALLOC_ZERO in t8_cmesh_init) means
+   * the check has not run yet; non-zero means it ran and passed. The cmesh is
+   * immutable post-commit, so the result stays valid for the cmesh's lifetime.
+   * Without this cache, t8_cmesh_is_committed walks the entire face-neighbor
+   * topology on every call; combined with the O(n_trees) callers of
+   * t8_cmesh_get_attribute that transit is_committed during t8_cmesh_commit
+   * (from inside build_vertex_to_tree), that produces O(n_trees^2) work in
+   * commit alone — multi-minute on meshes above ~1000 elements. See
+   * notes/plan_t8code_cad_evaluator_followup.md (defect D). */
+  int debug_validated;
 #endif
   t8_stash_t stash;       /**< Used as temporary storage for the trees before commit. */
   t8_cprofile_t *profile; /**< Used to measure runtimes and statistics of the cmesh algorithms. */
