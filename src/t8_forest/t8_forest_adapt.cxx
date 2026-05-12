@@ -30,6 +30,15 @@
 #include <t8_schemes/t8_scheme.hxx>
 #include <t8_data/t8_containers.h>
 
+#if T8_ENABLE_OPENMP
+#include <omp.h>
+#endif
+
+/** Maximum number of children across all default schemes (pyramid = 10).
+ *  Stack-allocate sibling pointer buffers in the parallel pre-pass at this
+ *  size — safe for every scheme t8 currently supports. */
+#define T8_FOREST_ADAPT_MAX_SIBLINGS 10
+
 /* We want to export the whole implementation to be callable from "C" */
 T8_EXTERN_C_BEGIN ();
 
@@ -377,6 +386,203 @@ t8_forest_adapt_refine_recursive (t8_forest_t forest, t8_locidx_t ltreeid, t8_ec
   } /* End while loop */
 }
 
+/** Per-element decision produced by the parallel pre-pass.
+ *
+ * For each element index i in 0..num_el_from-1 within a tree, the pre-pass
+ * fills one decision entry. The serial apply pass then walks the decision
+ * array and constructs the new tree's element array deterministically.
+ *
+ * Memory layout: 4 bytes per element, naturally aligned. The decision array
+ * is allocated once per tree (size num_el_from) and freed after the apply
+ * pass.
+ */
+typedef struct
+{
+  int8_t refine_code;   /**< -2 (remove), -1 (coarsen family), 0 (keep), +1 (refine) */
+  int8_t family_start;  /**< 1 if element i is the first of a complete coarsenable family, else 0 */
+  int8_t family_size;   /**< If family_start: num_siblings (typically 4). Else 1. */
+  int8_t reserved;      /**< Reserved for future use (e.g. user-data); pads to 4 bytes. */
+} t8_forest_adapt_decision_t;
+
+/** Parallel-friendly path for t8_forest_adapt's per-element loop.
+ *
+ * Two-pass design:
+ *   1. PRE-PASS (parallel under OpenMP): for each element index, determine
+ *      whether it's the start of a complete coarsenable family, then call
+ *      the user adapt callback with the appropriate is_family flag and
+ *      sibling buffer. Store the callback's return value in decisions[i].
+ *   2. APPLY PASS (serial): walk decisions sequentially and construct
+ *      the new tree's element array. Advances by 1 element for
+ *      refine/keep/remove, or by family_size for family-coarsen.
+ *
+ * Faithful to the existing t8 spec: coarsening rests on the family-start
+ * element's callback return value (with is_family=1), exactly as in the
+ * serial path. The "wasted" callback calls for non-family-start elements
+ * 1..N-1 of a soon-to-be-coarsened family are accepted as the cost of
+ * removing the serial dependency in the pre-pass.
+ *
+ * Gating: this path is invoked only when
+ *   - T8_ENABLE_OPENMP is defined at build time, AND
+ *   - forest->set_adapt_recursive == 0 (recursive paths use sc_list_t,
+ *     inherently serial), AND
+ *   - forest_from->incomplete_trees == 0 (incomplete-trees logic has
+ *     complex bookkeeping that's hard to parallelize correctly).
+ * Else, the original serial loop in t8_forest_adapt runs.
+ *
+ * The callback contract:
+ *   - The user's adapt callback may be invoked from multiple threads
+ *     simultaneously. It must be thread-safe (reads of shared state are
+ *     fine; writes must be synchronized or to thread-private storage).
+ *   - lelement_id is the (per-tree) index of the element being decided
+ *     for. Different threads see different lelement_id values; the
+ *     callback may use this to index into per-element shared data.
+ *
+ * \param [in]     forest           The new forest under construction.
+ * \param [in]     forest_from      The old forest (forest->set_from).
+ * \param [in]     ltree_id         The local tree id.
+ * \param [in]     tree_class       The element class for this tree.
+ * \param [in]     scheme           The element scheme.
+ * \param [in]     telements_from   The old tree's element array (read).
+ * \param [out]    telements        The new tree's element array (write).
+ * \param [in]     num_el_from      Number of elements in telements_from.
+ * \param [in,out] el_inserted_out  On exit, the number of elements pushed
+ *                                  to telements.
+ * \param [in,out] element_removed_out  Set to 1 if any element was removed.
+ */
+static void
+t8_forest_adapt_parallel_path (t8_forest_t forest, t8_forest_t forest_from, t8_locidx_t ltree_id,
+                                t8_eclass_t tree_class, const t8_scheme *scheme,
+                                t8_element_array_t *telements_from, t8_element_array_t *telements,
+                                t8_locidx_t num_el_from, t8_locidx_t *el_inserted_out, int *element_removed_out)
+{
+  T8_ASSERT (!forest->set_adapt_recursive);
+  T8_ASSERT (!forest_from->incomplete_trees);
+  T8_ASSERT (num_el_from > 0);
+
+  /* Allocate decision array, one entry per source element. */
+  t8_forest_adapt_decision_t *decisions = T8_ALLOC (t8_forest_adapt_decision_t, num_el_from);
+
+  /* ── PASS 1: parallel pre-pass ────────────────────────────────────── */
+  /* For each source element index, determine family-start status and call
+   * the user adapt callback. Each thread independently buffers up to
+   * T8_FOREST_ADAPT_MAX_SIBLINGS sibling pointers on its stack.
+   *
+   * schedule(dynamic, 64) — most callbacks do uniform work, but the
+   * family-start probe has variable cost (1 read for non-starts, N reads +
+   * elements_are_family for starts). Dynamic chunking absorbs the variance. */
+#if T8_ENABLE_OPENMP
+#pragma omp parallel for schedule(dynamic, 64)
+#endif
+  for (t8_locidx_t el_considered = 0; el_considered < num_el_from; ++el_considered) {
+    t8_element_t *fam[T8_FOREST_ADAPT_MAX_SIBLINGS];
+    t8_element_t *elem = t8_element_array_index_locidx_mutable (telements_from, el_considered);
+
+    /* Determine num_siblings for this element. For non-pyramid default
+     * schemes this is a constant per tree class, but we compute it
+     * per-element to stay correct for pyramid (which varies). */
+    const int num_siblings = scheme->element_get_num_siblings (tree_class, elem);
+    T8_ASSERT (num_siblings <= T8_FOREST_ADAPT_MAX_SIBLINGS);
+
+    /* Determine whether el_considered is the start of a complete family.
+     * Mirrors the serial path's logic at the existing inner loop (child_id
+     * probe + elements_are_family verification). */
+    int family_start = 0;
+    int num_to_callback = 1;
+    if (scheme->element_get_child_id (tree_class, elem) == 0 && el_considered + (t8_locidx_t) num_siblings <= num_el_from) {
+      /* Buffer all num_siblings candidate family members. */
+      int zz;
+      for (zz = 0; zz < num_siblings; ++zz) {
+        fam[zz] = t8_element_array_index_locidx_mutable (telements_from, el_considered + (t8_locidx_t) zz);
+        if (scheme->element_get_child_id (tree_class, fam[zz]) != zz) {
+          break;
+        }
+      }
+      if (zz == num_siblings && scheme->elements_are_family (tree_class, fam)) {
+        family_start = 1;
+        num_to_callback = num_siblings;
+      }
+    }
+    if (!family_start) {
+      fam[0] = elem;
+    }
+
+    /* Call the adapt callback. lelement_id = el_considered matches the
+     * serial path's contract. */
+    int refine = forest->set_adapt_fn (forest, forest_from, ltree_id, tree_class, el_considered, scheme, family_start,
+                                       num_to_callback, fam);
+    T8_ASSERT (family_start || refine != -1);
+
+    /* Apply max-level cap and refinable check (same as serial path). */
+    if (refine > 0
+        && (scheme->element_get_level (tree_class, fam[0]) >= forest->maxlevel
+            || !scheme->element_is_refinable (tree_class, fam[0]))) {
+      refine = 0;
+    }
+
+    /* Store decision. Writes are disjoint across iterations (one entry
+     * per el_considered), so no race. */
+    decisions[el_considered].refine_code = (int8_t) refine;
+    decisions[el_considered].family_start = (int8_t) family_start;
+    decisions[el_considered].family_size = (int8_t) num_to_callback;
+    decisions[el_considered].reserved = 0;
+  }
+
+  /* Implicit OMP barrier at end of parallel for guarantees decisions[]
+   * writes are visible to the apply pass below. */
+
+  /* ── PASS 2: serial apply pass ────────────────────────────────────── */
+  /* Walk decisions[] sequentially and build telements. Each iteration
+   * advances by 1 element (refine/keep/remove) or by family_size
+   * (family-coarsen). The serial dependency is el_inserted's running
+   * counter into telements. */
+  t8_locidx_t el_inserted = 0;
+  t8_element_t *children_buffer[T8_FOREST_ADAPT_MAX_SIBLINGS];
+
+  for (t8_locidx_t i = 0; i < num_el_from;) {
+    const t8_forest_adapt_decision_t d = decisions[i];
+
+    if (d.family_start && d.refine_code == -1) {
+      /* Coarsen the family: push parent of fam[0] to telements. */
+      t8_element_t *elem_from = t8_element_array_index_locidx_mutable (telements_from, i);
+      t8_element_t *parent_slot = t8_element_array_push (telements);
+      T8_ASSERT (scheme->element_get_level (tree_class, elem_from) > 0);
+      scheme->element_get_parent (tree_class, elem_from, parent_slot);
+      el_inserted++;
+      i += (t8_locidx_t) d.family_size;
+    }
+    else if (d.refine_code == 1) {
+      /* Refine: push num_children child slots, fill via element_get_children. */
+      t8_element_t *elem_from = t8_element_array_index_locidx_mutable (telements_from, i);
+      const int num_children = scheme->element_get_num_children (tree_class, elem_from);
+      T8_ASSERT (num_children <= T8_FOREST_ADAPT_MAX_SIBLINGS);
+      (void) t8_element_array_push_count (telements, num_children);
+      for (int zz = 0; zz < num_children; ++zz) {
+        children_buffer[zz] = t8_element_array_index_locidx_mutable (telements, el_inserted + (t8_locidx_t) zz);
+      }
+      scheme->element_get_children (tree_class, elem_from, num_children, children_buffer);
+      el_inserted += (t8_locidx_t) num_children;
+      i++;
+    }
+    else if (d.refine_code == 0) {
+      /* Keep: copy element_from to a new slot. */
+      t8_element_t *elem_from = t8_element_array_index_locidx_mutable (telements_from, i);
+      t8_element_t *new_el = t8_element_array_push (telements);
+      scheme->element_copy (tree_class, elem_from, new_el);
+      el_inserted++;
+      i++;
+    }
+    else {
+      /* Remove: skip without pushing. */
+      T8_ASSERT (d.refine_code == -2);
+      *element_removed_out = 1;
+      i++;
+    }
+  }
+
+  *el_inserted_out = el_inserted;
+  T8_FREE (decisions);
+}
+
 /* TODO: optimize this when we own forest_from */
 void
 t8_forest_adapt (t8_forest_t forest)
@@ -465,6 +671,25 @@ t8_forest_adapt (t8_forest_t forest)
       elements = T8_ALLOC (t8_element_t *, num_children);
       /* Buffer for a family of old elements */
       elements_from = T8_ALLOC (t8_element_t *, curr_size_elements_from);
+
+      /* ── Parallel-path gate ─────────────────────────────────────────
+       * If T8_ENABLE_OPENMP is on AND adaptation is non-recursive AND
+       * forest_from has no incomplete trees, dispatch the parallel
+       * two-pass implementation. Otherwise fall through to the
+       * serial while loop below. The two paths produce bit-identical
+       * output by construction; the parallel path simply distributes
+       * the per-element callback dispatch across threads. */
+      bool use_parallel_adapt = false;
+#if T8_ENABLE_OPENMP
+      if (!forest->set_adapt_recursive && !forest_from->incomplete_trees) {
+        use_parallel_adapt = true;
+      }
+#endif
+      if (use_parallel_adapt) {
+        t8_forest_adapt_parallel_path (forest, forest_from, ltree_id, tree->eclass, scheme, telements_from, telements,
+                                        num_el_from, &el_inserted, &element_removed);
+      }
+      else
       /* We now iterate over all elements in this tree and check them for refinement/coarsening. */
       while (el_considered < num_el_from) {
         /* Load the current element and at most num_siblings-1 many others into
