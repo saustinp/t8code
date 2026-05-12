@@ -35,6 +35,30 @@
 #include <utility>
 #include <algorithm>
 
+/* ════════════════════════════════════════════════════════════════════
+ * WARNING — THREAD-UNSAFE ELEMENT ALLOCATOR (PRE-T5 DESIGN STILL HERE)
+ * ════════════════════════════════════════════════════════════════════
+ *
+ * Unlike t8_default_scheme_common (which switched to std::malloc /
+ * std::free in T5 — commit d87bbf6a1 on branch thread_safety_geometry),
+ * this t8_standalone_scheme class STILL owns a single shared
+ * sc_mempool_t* (the `scheme_context` member). Concurrent calls to
+ * element_new / element_destroy from multiple threads will race on the
+ * mempool's free-list head and trigger element_is_valid
+ * assertion-aborts — the exact bug T5 fixed for the default schemes.
+ *
+ * Why it's not fixed here: amr_dev does not currently use any
+ * standalone scheme; every code path goes through t8_scheme_new_default
+ * (see amr_dev/src/mesh.cpp and src/AMR.cpp). Fixing this class was
+ * therefore out of scope for T5.
+ *
+ * If you ever route AMR work (or any OpenMP-parallel forest workload)
+ * through t8_standalone_scheme<>, this race will resurface. The fix is
+ * a copy of T5: replace the sc_mempool_t-backed element_new/element_
+ * destroy here with std::malloc/std::free, drop scheme_context entirely,
+ * empty the destructor. Tracked in this project's notes as "T5b".
+ * ════════════════════════════════════════════════════════════════════ */
+
 /** A templated implementation of the scheme interface based on cutting planes. */
 template <t8_eclass TEclass>
 struct t8_standalone_scheme: public t8_scheme_helpers<TEclass, t8_standalone_scheme<TEclass>>
@@ -1448,6 +1472,10 @@ struct t8_standalone_scheme: public t8_scheme_helpers<TEclass, t8_standalone_sch
   void
   element_new (const int length, t8_element_t **elems) const noexcept
   {
+    /* ⚠ T5b PENDING: this sc_mempool path races under OpenMP. See the
+     * thread-safety warning at the top of this file. Mirror T5
+     * (commit d87bbf6a1) — drop scheme_context, use std::malloc — if
+     * AMR ever routes through t8_standalone_scheme. */
     /* allocate memory */
     T8_ASSERT (this->scheme_context != NULL);
     T8_ASSERT (0 <= length);
@@ -1515,6 +1543,10 @@ struct t8_standalone_scheme: public t8_scheme_helpers<TEclass, t8_standalone_sch
   void
   element_destroy (const int length, t8_element_t **elems) const noexcept
   {
+    /* ⚠ T5b PENDING: this sc_mempool path races under OpenMP. See the
+     * thread-safety warning at the top of this file. Mirror T5
+     * (commit d87bbf6a1) — drop scheme_context, use std::free — if
+     * AMR ever routes through t8_standalone_scheme. */
     T8_ASSERT (this->scheme_context != NULL);
     T8_ASSERT (0 <= length);
     T8_ASSERT (elems != NULL);
