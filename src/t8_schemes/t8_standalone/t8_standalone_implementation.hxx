@@ -32,99 +32,57 @@
 #include <sc_functions.h>
 #include <t8_schemes/t8_standalone/t8_standalone_elements.hxx>
 #include <t8_schemes/t8_scheme_helpers.hxx>
+#include <cstdlib>
 #include <utility>
 #include <algorithm>
-
-/* ════════════════════════════════════════════════════════════════════
- * WARNING — THREAD-UNSAFE ELEMENT ALLOCATOR (PRE-T5 DESIGN STILL HERE)
- * ════════════════════════════════════════════════════════════════════
- *
- * Unlike t8_default_scheme_common (which switched to std::malloc /
- * std::free in T5 — commit d87bbf6a1 on branch thread_safety_geometry),
- * this t8_standalone_scheme class STILL owns a single shared
- * sc_mempool_t* (the `scheme_context` member). Concurrent calls to
- * element_new / element_destroy from multiple threads will race on the
- * mempool's free-list head and trigger element_is_valid
- * assertion-aborts — the exact bug T5 fixed for the default schemes.
- *
- * Why it's not fixed here: amr_dev does not currently use any
- * standalone scheme; every code path goes through t8_scheme_new_default
- * (see amr_dev/src/mesh.cpp and src/AMR.cpp). Fixing this class was
- * therefore out of scope for T5.
- *
- * If you ever route AMR work (or any OpenMP-parallel forest workload)
- * through t8_standalone_scheme<>, this race will resurface. The fix is
- * a copy of T5: replace the sc_mempool_t-backed element_new/element_
- * destroy here with std::malloc/std::free, drop scheme_context entirely,
- * empty the destructor. Tracked in this project's notes as "T5b".
- * ════════════════════════════════════════════════════════════════════ */
 
 /** A templated implementation of the scheme interface based on cutting planes. */
 template <t8_eclass TEclass>
 struct t8_standalone_scheme: public t8_scheme_helpers<TEclass, t8_standalone_scheme<TEclass>>
 {
  public:
-  /** Constructor
-  */
-  t8_standalone_scheme () noexcept
-    : element_size (sizeof (t8_standalone_element<TEclass>)), scheme_context (sc_mempool_new (element_size)) {};
+  /** Constructor.
+   *
+   * Pre-T5b: also created a shared sc_mempool_t for element storage,
+   * racy under OpenMP. Post-T5b (mirrors T5 on t8_default_scheme_common,
+   * commit d87bbf6a1): element_new/element_destroy use std::malloc /
+   * std::free directly, so no per-scheme allocator state is needed.
+   */
+  t8_standalone_scheme () noexcept: element_size (sizeof (t8_standalone_element<TEclass>)) {};
 
  protected:
-  size_t element_size;  /**< The size in bytes of an element of class \a eclass */
-  void *scheme_context; /**< Anonymous implementation context. */
+  size_t element_size; /**< The size in bytes of an element of class \a eclass */
 
  public:
-  /** Destructor for all default schemes */
-  ~t8_standalone_scheme ()
-  {
-    T8_ASSERT (scheme_context != NULL);
-    SC_ASSERT (((sc_mempool_t *) scheme_context)->elem_count == 0);
-    sc_mempool_destroy ((sc_mempool_t *) scheme_context);
-  }
+  /** Destructor.
+   *
+   * Pre-T5b: destroyed the shared sc_mempool here.
+   * Post-T5b: nothing to destroy. Element storage is freed
+   * individually in element_destroy via std::free. */
+  ~t8_standalone_scheme () {}
 
   /** Move constructor */
-  t8_standalone_scheme (t8_standalone_scheme &&other) noexcept
-    : element_size (other.element_size), scheme_context (std::exchange (other.scheme_context, nullptr))
-  {
-  }
+  t8_standalone_scheme (t8_standalone_scheme &&other) noexcept: element_size (other.element_size) {}
 
   /** Move assignment operator */
   t8_standalone_scheme &
   operator= (t8_standalone_scheme &&other) noexcept
   {
     if (this != &other) {
-      // Free existing resources of moved-to object
-      if (scheme_context) {
-        sc_mempool_destroy ((sc_mempool_t *) scheme_context);
-      }
-
-      // Transfer ownership of resources
       element_size = other.element_size;
-      scheme_context = other.scheme_context;
-
-      // Leave the source object in a valid state
-      other.scheme_context = nullptr;
     }
     return *this;
   }
 
   /** Copy constructor */
-  t8_standalone_scheme (const t8_standalone_scheme &other)
-    : element_size (other.element_size), scheme_context (sc_mempool_new (other.element_size)) {};
+  t8_standalone_scheme (const t8_standalone_scheme &other): element_size (other.element_size) {}
 
   /** Copy assignment operator */
   t8_standalone_scheme &
   operator= (const t8_standalone_scheme &other)
   {
     if (this != &other) {
-      // Free existing resources of assigned-to object
-      if (scheme_context) {
-        sc_mempool_destroy ((sc_mempool_t *) scheme_context);
-      }
-
-      // Copy the values from the source object
       element_size = other.element_size;
-      scheme_context = sc_mempool_new (other.element_size);
     }
     return *this;
   }
@@ -1472,17 +1430,15 @@ struct t8_standalone_scheme: public t8_scheme_helpers<TEclass, t8_standalone_sch
   void
   element_new (const int length, t8_element_t **elems) const noexcept
   {
-    /* ⚠ T5b PENDING: this sc_mempool path races under OpenMP. See the
-     * thread-safety warning at the top of this file. Mirror T5
-     * (commit d87bbf6a1) — drop scheme_context, use std::malloc — if
-     * AMR ever routes through t8_standalone_scheme. */
-    /* allocate memory */
-    T8_ASSERT (this->scheme_context != NULL);
+    /* T5b: allocate via std::malloc (thread-safe via glibc per-thread
+     * arenas) instead of the pre-T5b shared sc_mempool. Mirrors T5
+     * on t8_default_scheme_common (commit d87bbf6a1). */
     T8_ASSERT (0 <= length);
     T8_ASSERT (elems != NULL);
 
     for (int i = 0; i < length; ++i) {
-      elems[i] = (t8_element_t *) sc_mempool_alloc ((sc_mempool_t *) this->scheme_context);
+      elems[i] = (t8_element_t *) std::malloc (this->element_size);
+      T8_ASSERT (elems[i] != NULL);
     }
 
 /* in debug mode, set sensible default values. */
@@ -1543,15 +1499,12 @@ struct t8_standalone_scheme: public t8_scheme_helpers<TEclass, t8_standalone_sch
   void
   element_destroy (const int length, t8_element_t **elems) const noexcept
   {
-    /* ⚠ T5b PENDING: this sc_mempool path races under OpenMP. See the
-     * thread-safety warning at the top of this file. Mirror T5
-     * (commit d87bbf6a1) — drop scheme_context, use std::free — if
-     * AMR ever routes through t8_standalone_scheme. */
-    T8_ASSERT (this->scheme_context != NULL);
+    /* T5b: free via std::free, matching std::malloc in element_new.
+     * Mirrors T5 on t8_default_scheme_common (commit d87bbf6a1). */
     T8_ASSERT (0 <= length);
     T8_ASSERT (elems != NULL);
     for (int i = 0; i < length; ++i) {
-      sc_mempool_free ((sc_mempool_t *) scheme_context, elems[i]);
+      std::free (elems[i]);
     }
   }
 
