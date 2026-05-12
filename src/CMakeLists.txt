@@ -66,6 +66,13 @@ if ( T8CODE_ENABLE_MPI )
     target_link_libraries( T8 PUBLIC MPI::MPI_C )
 endif()
 
+if( T8CODE_ENABLE_OPENMP )
+    # T8_ENABLE_OPENMP is PUBLIC because downstream code (e.g. amr_dev's
+    # callbacks) may inspect it to assert thread-safety expectations.
+    target_compile_definitions( T8 PUBLIC T8_ENABLE_OPENMP=1 )
+    target_link_libraries( T8 PUBLIC OpenMP::OpenMP_CXX )
+endif()
+
 if( T8CODE_ENABLE_VTK )
     set (T8CODE_VTK_VERSION_USED "${VTK_MAJOR_VERSION}.${VTK_MINOR_VERSION}")
     # Define T8_VTK_VERSION_USED for internal and external use in source files.

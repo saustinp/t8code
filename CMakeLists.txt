@@ -68,6 +68,11 @@ option( T8CODE_ENABLE_VTK "Enable t8code's features which rely on VTK" OFF )
 option( T8CODE_ENABLE_OCC "Enable t8code's features which rely on OpenCASCADE" OFF )
 option( T8_ENABLE_METIS "Enable t8code's features which rely on METIS" OFF )
 option( T8CODE_ENABLE_GMSH "Enable reading gmsh physical groups via the gmsh API" OFF )
+# When ON, t8code's t8_forest_adapt and t8_forest_iterate_replace parallelize
+# their per-element callback dispatch loops with OpenMP. Currently default OFF
+# to preserve upstream behavior. amr_dev consumers enable this via the
+# installer (-DT8CODE_ENABLE_OPENMP=ON).
+option( T8CODE_ENABLE_OPENMP "Enable shared-memory parallelism (OpenMP) in t8_forest_adapt and t8_forest_iterate_replace" OFF )
 
 option( T8CODE_USE_SYSTEM_SC "Use system-installed sc library" OFF )
 option( T8CODE_USE_SYSTEM_P4EST "Use system-installed p4est library" OFF )
@@ -157,6 +162,13 @@ if( T8CODE_ENABLE_OCC )
         message("Found OpenCASCADE")
     endif (OpenCASCADE_FOUND)
 endif( T8CODE_ENABLE_OCC )
+
+if( T8CODE_ENABLE_OPENMP )
+    find_package( OpenMP REQUIRED COMPONENTS C CXX )
+    if( OpenMP_CXX_FOUND )
+        message( STATUS "Found OpenMP: ${OpenMP_CXX_VERSION} (flags: ${OpenMP_CXX_FLAGS})" )
+    endif()
+endif( T8CODE_ENABLE_OPENMP )
 
 if(T8_ENABLE_METIS)
     # 1. Look for the header file
