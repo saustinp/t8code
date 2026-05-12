@@ -29,6 +29,12 @@
 #include <t8_forest/t8_forest_general.h>
 #include <t8_schemes/t8_scheme.hxx>
 
+#include <vector>
+
+#if T8_ENABLE_OPENMP
+#include <omp.h>
+#endif
+
 /* We want to export the whole implementation to be callable from "C" */
 T8_EXTERN_C_BEGIN ();
 
@@ -377,6 +383,146 @@ t8_forest_search (t8_forest_t forest, t8_forest_search_fn search_fn, t8_forest_q
   }
 }
 
+/** One pre-computed step of t8_forest_iterate_replace's per-tree walk.
+ *
+ * The serial walk advances ielem_new/ielem_old in lockstep with a
+ * data-dependent stride (1 for keep/refine-by-1; num_children for
+ * refine and coarsen). The parallel path replaces the user-callback
+ * dispatch with a precomputed step list that records, per step, the
+ * (refine, num_outgoing, first_outgoing, num_incoming, first_incoming)
+ * tuple the callback would have received. Stride bookkeeping happens
+ * only in the serial pre-walk; the parallel apply just unpacks each
+ * step's tuple and calls replace_fn.
+ */
+typedef struct
+{
+  int refine;                   /**< 0 = keep, +1 = refined old→new, -1 = coarsened old→new */
+  int num_outgoing;             /**< Old-forest family size for this step */
+  t8_locidx_t first_outgoing;   /**< Old-forest first element index for this step */
+  int num_incoming;             /**< New-forest family size for this step */
+  t8_locidx_t first_incoming;   /**< New-forest first element index for this step */
+} t8_forest_iterate_replace_step_t;
+
+/** Parallel-friendly path for t8_forest_iterate_replace's per-tree
+ * lockstep walk.
+ *
+ * Two-pass design (inverse of t8_forest_adapt's parallel path: pre-pass
+ * here is SERIAL/cheap, apply pass is PARALLEL/expensive):
+ *
+ *   1. PRE-PASS (serial, fast): walk forest_new and forest_old in
+ *      lockstep, comparing levels at each step. Build a list of
+ *      ReplaceStep entries. No replace_fn calls here. The serial
+ *      dependency is the running ielem_new/ielem_old advance.
+ *   2. APPLY PASS (parallel under OpenMP): for each step, invoke
+ *      replace_fn with the precomputed indices. Steps are
+ *      independent of each other by construction (no step's input
+ *      depends on another step's output), so concurrent dispatch
+ *      is safe IF the user's replace_fn is thread-safe.
+ *
+ * Caller contract change:
+ *   - When t8 is built with T8_ENABLE_OPENMP=1, replace_fn may be
+ *     invoked from multiple threads simultaneously. It must be
+ *     thread-safe (writes to shared state must be synchronized or
+ *     directed to thread-local storage).
+ *   - amr_dev's build_interpolation_table_cback uses a per-thread
+ *     accumulator pattern (commit 2877540) to satisfy this.
+ *
+ * Gating: this path runs only when
+ *   - T8_ENABLE_OPENMP=1 at build time, AND
+ *   - forest_new->incomplete_trees == 0 (incomplete-trees handling
+ *     has removal logic and asymmetric advance patterns; the serial
+ *     path keeps that complexity contained).
+ *
+ * \param [in]  forest_new          The post-adapt forest.
+ * \param [in]  forest_old          The pre-adapt forest.
+ * \param [in]  ltree_id            The local tree id.
+ * \param [in]  tree_class          The element class for this tree.
+ * \param [in]  scheme              The element scheme.
+ * \param [in]  elems_per_tree_new  Number of elements in forest_new's tree.
+ * \param [in]  elems_per_tree_old  Number of elements in forest_old's tree.
+ * \param [in]  replace_fn          The user callback (must be thread-safe).
+ */
+static void
+t8_forest_iterate_replace_parallel_path (t8_forest_t forest_new, t8_forest_t forest_old, t8_locidx_t ltree_id,
+                                         const t8_eclass_t tree_class, const t8_scheme *scheme,
+                                         const t8_locidx_t elems_per_tree_new, const t8_locidx_t elems_per_tree_old,
+                                         t8_forest_replace_t replace_fn)
+{
+  T8_ASSERT (!forest_new->incomplete_trees);
+
+  /* ── PASS 1: serial pre-walk, build step list ────────────────────── */
+  std::vector<t8_forest_iterate_replace_step_t> steps;
+  /* Conservative upper bound: every old-mesh element produces at most
+   * one step (when it's the start of a refine/coarsen/keep group). */
+  steps.reserve (static_cast<size_t> (elems_per_tree_old));
+
+  t8_locidx_t ielem_new = 0;
+  t8_locidx_t ielem_old = 0;
+  while (ielem_new < elems_per_tree_new) {
+    T8_ASSERT (ielem_old < elems_per_tree_old);
+    const t8_element_t *elem_new = t8_forest_get_leaf_element_in_tree (forest_new, ltree_id, ielem_new);
+    const t8_element_t *elem_old = t8_forest_get_leaf_element_in_tree (forest_old, ltree_id, ielem_old);
+    const int level_new = scheme->element_get_level (tree_class, elem_new);
+    const int level_old = scheme->element_get_level (tree_class, elem_old);
+
+    t8_forest_iterate_replace_step_t step;
+    if (level_old < level_new) {
+      /* elem_old was refined */
+      T8_ASSERT (level_new == level_old + 1);
+      const t8_locidx_t family_size = scheme->element_get_num_children (tree_class, elem_old);
+      step.refine = 1;
+      step.num_outgoing = 1;
+      step.first_outgoing = ielem_old;
+      step.num_incoming = (int) family_size;
+      step.first_incoming = ielem_new;
+      ielem_new += family_size;
+      ielem_old++;
+    }
+    else if (level_old > level_new) {
+      /* elem_old was coarsened */
+      T8_ASSERT (level_new == level_old - 1);
+      const t8_locidx_t family_size = scheme->element_get_num_children (tree_class, elem_new);
+      step.refine = -1;
+      step.num_outgoing = (int) family_size;
+      step.first_outgoing = ielem_old;
+      step.num_incoming = 1;
+      step.first_incoming = ielem_new;
+      ielem_new++;
+      ielem_old += family_size;
+    }
+    else {
+      /* elem_new == elem_old (kept) */
+      T8_ASSERT (scheme->element_is_equal (tree_class, elem_new, elem_old));
+      step.refine = 0;
+      step.num_outgoing = 1;
+      step.first_outgoing = ielem_old;
+      step.num_incoming = 1;
+      step.first_incoming = ielem_new;
+      ielem_new++;
+      ielem_old++;
+    }
+    steps.push_back (step);
+  }
+  T8_ASSERT (ielem_new == elems_per_tree_new);
+  T8_ASSERT (ielem_old == elems_per_tree_old);
+
+  /* ── PASS 2: parallel apply ──────────────────────────────────────── */
+  /* Each step's (forest_old, forest_new, ltree_id, tree_class, scheme,
+   * refine, num_outgoing, first_outgoing, num_incoming, first_incoming)
+   * tuple is read-only here. replace_fn must be thread-safe per the
+   * contract documented above. schedule(dynamic, 64) absorbs per-call
+   * cost variance. */
+  const size_t n_steps = steps.size ();
+#if T8_ENABLE_OPENMP
+#pragma omp parallel for schedule(dynamic, 64)
+#endif
+  for (size_t i = 0; i < n_steps; ++i) {
+    const t8_forest_iterate_replace_step_t &s = steps[i];
+    replace_fn (forest_old, forest_new, ltree_id, tree_class, scheme, s.refine, s.num_outgoing, s.first_outgoing,
+                s.num_incoming, s.first_incoming);
+  }
+}
+
 void
 t8_forest_iterate_replace (t8_forest_t forest_new, t8_forest_t forest_old, t8_forest_replace_t replace_fn)
 {
@@ -398,6 +544,27 @@ t8_forest_iterate_replace (t8_forest_t forest_new, t8_forest_t forest_old, t8_fo
     /* Get the eclass of the tree */
     t8_eclass_t tree_class = t8_forest_get_tree_class (forest_new, itree);
     T8_ASSERT (tree_class == t8_forest_get_tree_class (forest_old, itree));
+
+    /* ── Parallel-path gate ──────────────────────────────────────────
+     * When T8_ENABLE_OPENMP is on AND forest_new has no incomplete
+     * trees, dispatch the parallel two-pass implementation: serial
+     * pre-walk builds a step list, then a #pragma omp parallel for
+     * dispatches replace_fn across threads. The CALLER's replace_fn
+     * must be thread-safe in this build configuration (see the
+     * helper function's doc comment for the contract). Falls
+     * through to the existing serial path otherwise. */
+    bool use_parallel_replace = false;
+#if T8_ENABLE_OPENMP
+    if (!forest_new->incomplete_trees && elems_per_tree_new > 0) {
+      use_parallel_replace = true;
+    }
+#endif
+    if (use_parallel_replace) {
+      t8_forest_iterate_replace_parallel_path (forest_new, forest_old, itree, tree_class, scheme, elems_per_tree_new,
+                                               elems_per_tree_old, replace_fn);
+      continue; /* Skip the serial while loop for this tree. */
+    }
+
     t8_locidx_t ielem_new = 0;
     t8_locidx_t ielem_old = 0;
     while (ielem_new < elems_per_tree_new) {
