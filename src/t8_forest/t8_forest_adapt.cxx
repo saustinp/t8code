@@ -395,12 +395,60 @@ t8_forest_adapt_refine_recursive (t8_forest_t forest, t8_locidx_t ltreeid, t8_ec
  * Memory layout: 4 bytes per element, naturally aligned. The decision array
  * is allocated once per tree (size num_el_from) and freed after the apply
  * pass.
+ *
+ * ──────────────────────────────────────────────────────────────────────────
+ * DESIGN DECISION (recorded for future revisit) — defensive 3-field struct
+ *                                                  vs. minimal 1-field struct
+ * ──────────────────────────────────────────────────────────────────────────
+ *
+ * `family_start` and `family_size` are technically REDUNDANT given the t8
+ * callback contract. The contract (asserted at the inner serial loop and
+ * checked again in the parallel pre-pass) is:
+ *
+ *     T8_ASSERT (is_family || refine != -1);
+ *
+ * — the user callback may return -1 only when invoked with is_family=1, and
+ * we invoke with is_family=1 only at family-start positions. Therefore
+ * `refine_code == -1` *implies* family_start by construction; one could in
+ * principle compute family_size on the fly via
+ * `scheme->element_get_num_siblings(...)` at the coarsen branch of the
+ * apply pass.
+ *
+ * A "minimal" alternative struct would be just `int8_t refine_code` per
+ * element (4× memory reduction), with the apply pass checking
+ * `decision[i] == -1` and recomputing num_siblings in that branch.
+ *
+ * We picked the defensive 3-field layout for three reasons:
+ *
+ *   1. Guards against malformed callbacks in release builds. The T8_ASSERT
+ *      protecting the contract is debug-only; in release, a callback that
+ *      incorrectly returns -1 for is_family=0 would slip through. With the
+ *      explicit `family_start && refine_code == -1` check in the apply
+ *      pass, such a callback gets its decision downgraded to "keep" rather
+ *      than corrupting the forest by skipping num_siblings elements that
+ *      should have been processed individually.
+ *
+ *   2. Avoids a `scheme->element_get_num_siblings` call in the apply
+ *      pass's coarsen branch (perf saving is microseconds-per-coarsen, but
+ *      free).
+ *
+ *   3. Self-documenting: the 3-field struct makes the data flow explicit.
+ *
+ * Future revisit triggers: if memory pressure ever becomes the binding
+ * constraint on very large meshes (decisions[] grows linearly with
+ * elements), switching to the 1-field layout reduces this allocation
+ * 4×. The corresponding apply-pass change is small. The validation
+ * gate would be the same (strict bit-identity at all NT). No semantic
+ * difference in well-behaved callbacks.
+ * ──────────────────────────────────────────────────────────────────────────
  */
 typedef struct
 {
   int8_t refine_code;   /**< -2 (remove), -1 (coarsen family), 0 (keep), +1 (refine) */
-  int8_t family_start;  /**< 1 if element i is the first of a complete coarsenable family, else 0 */
-  int8_t family_size;   /**< If family_start: num_siblings (typically 4). Else 1. */
+  int8_t family_start;  /**< 1 if element i is the first of a complete coarsenable family, else 0.
+                             REDUNDANT given the callback contract; see design-decision note above. */
+  int8_t family_size;   /**< If family_start: num_siblings (typically 4). Else 1.
+                             RECOMPUTABLE from scheme->element_get_num_siblings; cached for speed. */
   int8_t reserved;      /**< Reserved for future use (e.g. user-data); pads to 4 bytes. */
 } t8_forest_adapt_decision_t;
 
@@ -541,6 +589,12 @@ t8_forest_adapt_parallel_path (t8_forest_t forest, t8_forest_t forest_from, t8_l
   for (t8_locidx_t i = 0; i < num_el_from;) {
     const t8_forest_adapt_decision_t d = decisions[i];
 
+    /* Check both family_start and refine_code == -1. The callback contract
+     * guarantees refine_code == -1 only ever appears at family-start
+     * positions (asserted in the pre-pass), so the family_start check is
+     * defensively redundant — kept as a release-mode guard against
+     * malformed callbacks. See the design-decision note on
+     * t8_forest_adapt_decision_t above. */
     if (d.family_start && d.refine_code == -1) {
       /* Coarsen the family: push parent of fam[0] to telements. */
       t8_element_t *elem_from = t8_element_array_index_locidx_mutable (telements_from, i);
