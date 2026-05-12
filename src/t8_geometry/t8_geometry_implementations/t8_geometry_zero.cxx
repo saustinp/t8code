@@ -53,7 +53,7 @@ t8_geometry_zero::t8_geom_evaluate_jacobian ([[maybe_unused]] t8_cmesh_t cmesh, 
                                              double *jacobian) const
 {
   /* Set the jacobian to 0 */
-  const int tree_dim = t8_eclass_to_dimension[active_tree_class];
+  const int tree_dim = t8_eclass_to_dimension[active_tree_class()];
   memset (jacobian, 0, sizeof (double) * 3 * tree_dim * num_coords);
 }
 

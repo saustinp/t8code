@@ -232,8 +232,12 @@ struct t8_geometry_cad: public t8_geometry_with_vertices
   gp_Pnt
   process_surface (const int surface_index, const double *params) const;
 
-  const int *edges; /**< The linked edges of the currently active tree. */
-  const int *faces; /**< The linked faces of the currently active tree. */
+  /* Note: the former `edges` and `faces` instance members (linked
+   * CAD edges / faces of the currently active tree) have been moved
+   * into the t8_geometry base class's per-thread TLSEntry cache.
+   * Read via the inherited `active_edges()` and `active_faces()`
+   * accessors; write via `set_active_edges(...)` / `set_active_faces(...)`
+   * (currently only the load_tree_data override does so). */
 
   std::shared_ptr<t8_cad> cad_manager; /**< The CAD manager of the geometry. */
 };

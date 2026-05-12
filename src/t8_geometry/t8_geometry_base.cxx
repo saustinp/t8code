@@ -27,6 +27,17 @@
 #include <t8_geometry/t8_geometry_base.hxx>
 #include <t8_geometry/t8_geometry_base.h>
 
+#include <atomic>
+#include <unordered_map>
+
+/* Static-member definitions: one per-thread cache map per process, one
+ * global atomic counter handing out unique instance ids for generation
+ * checking. See t8_geometry_base.hxx for the design rationale. */
+thread_local std::unordered_map<const t8_geometry *, t8_geometry::TLSEntry>
+  t8_geometry::tls_cache_;
+
+std::atomic<uint64_t> t8_geometry::next_instance_id_{ 0 };
+
 const char *
 t8_geom_get_name (const t8_geometry_c *geom)
 {
@@ -43,24 +54,29 @@ t8_geom_get_type (const t8_geometry_c *geom)
   return geom->t8_geom_get_type ();
 }
 
-/* Load the id and class of the newly active tree to the active_tree and active_tree_class variable. */
+/* Load the id and class of the newly active tree into this thread's
+ * cached TLSEntry for this geometry. (Previously these were instance
+ * members; now they live in a per-thread cache to remove the
+ * cross-tree race exposed by the t8 thread-safety microbench.) */
 void
 t8_geometry::t8_geom_load_tree_data (const t8_cmesh_t cmesh, const t8_gloidx_t gtreeid)
 {
-  /* Set active id and eclass */
+  /* Set active id and eclass via thread-local setters. */
   const t8_locidx_t ltreeid = t8_cmesh_get_local_id (cmesh, gtreeid);
-  active_tree = gtreeid;
+  set_active_tree (gtreeid);
   const t8_locidx_t num_local_trees = t8_cmesh_get_num_local_trees (cmesh);
+  t8_eclass_t this_tree_class;
   if (0 <= ltreeid && ltreeid < num_local_trees) {
-    active_tree_class = t8_cmesh_get_tree_class (cmesh, ltreeid);
+    this_tree_class = t8_cmesh_get_tree_class (cmesh, ltreeid);
   }
   else {
-    active_tree_class = t8_cmesh_get_ghost_class (cmesh, ltreeid - num_local_trees);
+    this_tree_class = t8_cmesh_get_ghost_class (cmesh, ltreeid - num_local_trees);
   }
+  set_active_tree_class (this_tree_class);
 
   /* Check whether we support this class */
-  T8_ASSERT (active_tree_class == T8_ECLASS_VERTEX || active_tree_class == T8_ECLASS_TRIANGLE
-             || active_tree_class == T8_ECLASS_TET || active_tree_class == T8_ECLASS_QUAD
-             || active_tree_class == T8_ECLASS_HEX || active_tree_class == T8_ECLASS_LINE
-             || active_tree_class == T8_ECLASS_PRISM || active_tree_class == T8_ECLASS_PYRAMID);
+  T8_ASSERT (this_tree_class == T8_ECLASS_VERTEX || this_tree_class == T8_ECLASS_TRIANGLE
+             || this_tree_class == T8_ECLASS_TET || this_tree_class == T8_ECLASS_QUAD
+             || this_tree_class == T8_ECLASS_HEX || this_tree_class == T8_ECLASS_LINE
+             || this_tree_class == T8_ECLASS_PRISM || this_tree_class == T8_ECLASS_PYRAMID);
 }

@@ -44,17 +44,17 @@ t8_geometry_quadrangulated_disk::t8_geom_evaluate ([[maybe_unused]] t8_cmesh_t c
     for (size_t i_coord = 0; i_coord < num_coords; i_coord++) {
       const size_t offset_2d = 2 * i_coord;
       const size_t offset_3d = 3 * i_coord;
-      t8_geom_linear_interpolation (ref_coords + offset_2d, active_tree_vertices, 3, 2, out_coords + offset_3d);
+      t8_geom_linear_interpolation (ref_coords + offset_2d, active_tree_vertices(), 3, 2, out_coords + offset_3d);
     }
     return;
   }
 
   /* Normal vector along one of the straight edges of the quad. */
-  t8_copy (active_tree_vertices, n);
+  t8_copy (active_tree_vertices(), n);
   t8_normalize (n);
 
   /* Radial vector parallel to one of the tilted edges of the quad. */
-  t8_copy (active_tree_vertices + 9, r);
+  t8_copy (active_tree_vertices() + 9, r);
   t8_normalize (r);
 
   const double inv_denominator = 1.0 / t8_dot (r, n);
@@ -80,12 +80,12 @@ t8_geometry_quadrangulated_disk::t8_geom_evaluate ([[maybe_unused]] t8_cmesh_t c
       corr_ref_coords[2] = 0.0;
 
       /* Compute and normalize vector `s`. */
-      t8_geom_linear_interpolation (corr_ref_coords, active_tree_vertices, 3, 2, s);
+      t8_geom_linear_interpolation (corr_ref_coords, active_tree_vertices(), 3, 2, s);
       t8_normalize (s);
     }
 
     /* Correction in order to rectify elements near the corners. */
-    t8_geom_linear_interpolation (ref_coords + offset_2d, active_tree_vertices, 3, 2, p);
+    t8_geom_linear_interpolation (ref_coords + offset_2d, active_tree_vertices(), 3, 2, p);
 
     /* Compute intersection of line with a plane. */
     const double out_radius = t8_dot (p, n) * inv_denominator;
@@ -97,15 +97,15 @@ t8_geometry_quadrangulated_disk::t8_geom_evaluate ([[maybe_unused]] t8_cmesh_t c
 }
 
 static inline void
-t8_geom_evaluate_sphere_tri_prism (const double *active_tree_vertices, const t8_eclass_t eclass,
+t8_geom_evaluate_sphere_tri_prism (const double *tree_vertices, const t8_eclass_t eclass,
                                    const double *ref_coords, const size_t num_coords, double *out_coords)
 {
   // All elements are aligned such that the reference z-direction follows the
   // outward radial direction of the sphere. Hence the inner radius is equal to
-  // the norm of the first position vector of `active_tree_vertices`.
-  const double inner_radius = t8_norm (active_tree_vertices);
+  // the norm of the first position vector of `tree_vertices`.
+  const double inner_radius = t8_norm (tree_vertices);
 
-  t8_geom_compute_linear_geometry (eclass, active_tree_vertices, ref_coords, num_coords, out_coords);
+  t8_geom_compute_linear_geometry (eclass, tree_vertices, ref_coords, num_coords, out_coords);
 
   if (eclass == T8_ECLASS_TRIANGLE) {
     for (size_t i_coord = 0; i_coord < num_coords; i_coord++) {
@@ -115,7 +115,7 @@ t8_geom_evaluate_sphere_tri_prism (const double *active_tree_vertices, const t8_
   }
   else {
     const size_t outer_vertex_offset = 3 * 3;
-    const double shell_thickness = t8_norm (active_tree_vertices + outer_vertex_offset) - inner_radius;
+    const double shell_thickness = t8_norm (tree_vertices + outer_vertex_offset) - inner_radius;
     for (size_t i_coord = 0; i_coord < num_coords; i_coord++) {
       const size_t offset = 3 * i_coord;
       const double z = ref_coords[offset + 2];
@@ -130,7 +130,7 @@ t8_geometry_triangulated_spherical_surface::t8_geom_evaluate ([[maybe_unused]] t
                                                               const double *ref_coords, const size_t num_coords,
                                                               double *out_coords) const
 {
-  t8_geom_evaluate_sphere_tri_prism (active_tree_vertices, T8_ECLASS_TRIANGLE, ref_coords, num_coords, out_coords);
+  t8_geom_evaluate_sphere_tri_prism (active_tree_vertices(), T8_ECLASS_TRIANGLE, ref_coords, num_coords, out_coords);
 }
 
 void
@@ -139,7 +139,7 @@ t8_geometry_prismed_spherical_shell::t8_geom_evaluate ([[maybe_unused]] t8_cmesh
                                                        const size_t num_coords, double *out_coords) const
 
 {
-  t8_geom_evaluate_sphere_tri_prism (active_tree_vertices, T8_ECLASS_PRISM, ref_coords, num_coords, out_coords);
+  t8_geom_evaluate_sphere_tri_prism (active_tree_vertices(), T8_ECLASS_PRISM, ref_coords, num_coords, out_coords);
 }
 
 void
@@ -157,11 +157,11 @@ t8_geometry_tessellated_spherical_surface::t8_geom_evaluate ([[maybe_unused]] t8
   double tangent2[3];  // Second tangent vector.
 
   // Compute normal vector of the current cmesh cell.
-  t8_normal_of_tri (active_tree_vertices, active_tree_vertices + 3, active_tree_vertices + 6, normal);
+  t8_normal_of_tri (active_tree_vertices(), active_tree_vertices() + 3, active_tree_vertices() + 6, normal);
   t8_normalize (normal);
 
   // Compute sphere's radius over cube root which is the shortest distance to the origin (0,0,0).
-  const double distance = std::abs (t8_dot (active_tree_vertices, normal));
+  const double distance = std::abs (t8_dot (active_tree_vertices(), normal));
 
   // Compute actual radius of the sphere.
   const double radius = distance * std::sqrt (3.0);
@@ -180,7 +180,7 @@ t8_geometry_tessellated_spherical_surface::t8_geom_evaluate ([[maybe_unused]] t8
 
     // Compute the the position vector in the cmesh element.
     double position[3];
-    t8_geom_compute_linear_geometry (active_tree_class, active_tree_vertices, ref_coords + offset_2d, 1, position);
+    t8_geom_compute_linear_geometry (active_tree_class(), active_tree_vertices(), ref_coords + offset_2d, 1, position);
 
     // Compute difference vector between position and tripod's anchor.
     double diff_vec[3];
@@ -214,17 +214,17 @@ t8_geometry_cubed_spherical_shell::t8_geom_evaluate ([[maybe_unused]] t8_cmesh_t
   double tangent2[3];  // Second tangent vector.
 
   // Compute normal vector of the current cmesh cell.
-  t8_normal_of_tri (active_tree_vertices, active_tree_vertices + 3, active_tree_vertices + 6, normal);
+  t8_normal_of_tri (active_tree_vertices(), active_tree_vertices() + 3, active_tree_vertices() + 6, normal);
   t8_normalize (normal);
 
   // Compute sphere's radius over cube root which is the shortest distance to the origin (0,0,0).
-  const double distance = std::abs (t8_dot (active_tree_vertices, normal));
+  const double distance = std::abs (t8_dot (active_tree_vertices(), normal));
 
   // Compute actual radius of the sphere.
   const double SQRT3 = std::sqrt (3.0);
   const double inner_radius = distance * SQRT3;
   const double shell_thickness
-    = std::abs (t8_dot (active_tree_vertices + t8_eclass_num_vertices[active_tree_class] * 3 / 2, normal)) * SQRT3
+    = std::abs (t8_dot (active_tree_vertices() + t8_eclass_num_vertices[active_tree_class()] * 3 / 2, normal)) * SQRT3
       - inner_radius;
 
   // Compute orthogonal coordinate system anchored on the cmesh element.
@@ -235,7 +235,7 @@ t8_geometry_cubed_spherical_shell::t8_geom_evaluate ([[maybe_unused]] t8_cmesh_t
   t8_axy (normal, anchor, distance);
 
   t8_eclass_t interpolation_eclass;
-  switch (active_tree_class) {
+  switch (active_tree_class()) {
   case T8_ECLASS_HEX:
     interpolation_eclass = T8_ECLASS_QUAD;
     break;
@@ -251,7 +251,7 @@ t8_geometry_cubed_spherical_shell::t8_geom_evaluate ([[maybe_unused]] t8_cmesh_t
 
     // Compute the the position vector in the cmesh element.
     double position[3];
-    t8_geom_compute_linear_geometry (interpolation_eclass, active_tree_vertices, ref_coords + offset_3d, 1, position);
+    t8_geom_compute_linear_geometry (interpolation_eclass, active_tree_vertices(), ref_coords + offset_3d, 1, position);
 
     // Compute difference vector between position and tripod's anchor.
     double diff_vec[3];
@@ -284,15 +284,15 @@ t8_geometry_cubed_sphere::t8_geom_evaluate ([[maybe_unused]] t8_cmesh_t cmesh, t
   if (gtreeid % 4 == 0) {
     for (size_t i_coord = 0; i_coord < num_coords; i_coord++) {
       const size_t offset = 3 * i_coord;
-      t8_geom_linear_interpolation (ref_coords + offset, active_tree_vertices, 3, 3, out_coords + offset);
+      t8_geom_linear_interpolation (ref_coords + offset, active_tree_vertices(), 3, 3, out_coords + offset);
     }
     return;
   }
 
-  t8_copy (active_tree_vertices, n);
+  t8_copy (active_tree_vertices(), n);
   t8_normalize (n);
 
-  t8_copy (active_tree_vertices + 7 * 3, r);
+  t8_copy (active_tree_vertices() + 7 * 3, r);
   t8_normalize (r);
 
   const double inv_denominator = 1.0 / t8_dot (r, n);
@@ -325,11 +325,11 @@ t8_geometry_cubed_sphere::t8_geom_evaluate ([[maybe_unused]] t8_cmesh_t cmesh, t
       corr_ref_coords[p_coord] = tan (0.25 * M_PI * p_ref);
 
       /* Compute and normalize vector `s`. */
-      t8_geom_linear_interpolation (corr_ref_coords, active_tree_vertices, 3, 3, s);
+      t8_geom_linear_interpolation (corr_ref_coords, active_tree_vertices(), 3, 3, s);
       t8_normalize (s);
     }
 
-    t8_geom_linear_interpolation (ref_coords + offset, active_tree_vertices, 3, 3, p);
+    t8_geom_linear_interpolation (ref_coords + offset, active_tree_vertices(), 3, 3, p);
 
     /* Compute intersection of line with a plane. */
     const double out_radius = t8_dot (p, n) * inv_denominator;

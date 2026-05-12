@@ -58,7 +58,7 @@ t8_geometry_lagrange::t8_geom_evaluate ([[maybe_unused]] t8_cmesh_t cmesh, [[may
   for (size_t i_component = 0; i_component < T8_ECLASS_MAX_DIM; i_component++) {
     double inner_product = 0;
     for (size_t j_vertex = 0; j_vertex < n_vertex; j_vertex++) {
-      const double coordinate = active_tree_vertices[j_vertex * T8_ECLASS_MAX_DIM + i_component];
+      const double coordinate = active_tree_vertices()[j_vertex * T8_ECLASS_MAX_DIM + i_component];
       const double basis_function = basis_functions[j_vertex];
       inner_product += basis_function * coordinate;
     }
@@ -81,76 +81,78 @@ t8_geometry_lagrange::t8_geom_load_tree_data (t8_cmesh_t cmesh, t8_gloidx_t gtre
 {
   t8_geometry_with_vertices::t8_geom_load_tree_data (cmesh, gtreeid);
   const t8_locidx_t ltreeid = t8_cmesh_get_local_id (cmesh, gtreeid);
-  degree
+  const int *deg
     = (const int *) t8_cmesh_get_attribute (cmesh, t8_get_package_id (), T8_CMESH_LAGRANGE_POLY_DEGREE_KEY, ltreeid);
-  T8_ASSERT (degree != NULL);
+  T8_ASSERT (deg != NULL);
+  /* Store into this thread's TLSEntry cache (formerly an instance member). */
+  set_active_degree (deg);
 }
 
 inline std::vector<double>
 t8_geometry_lagrange::t8_geom_compute_basis (const double *ref_coords) const
 {
-  switch (active_tree_class) {
+  switch (active_tree_class()) {
   case T8_ECLASS_LINE:
-    switch (*degree) {
+    switch (*active_degree()) {
     case 1:
       return t8_geometry_lagrange::t8_geom_s2_basis (ref_coords);
     case 2:
       return t8_geometry_lagrange::t8_geom_s3_basis (ref_coords);
     default:
-      SC_ABORTF ("Error: Lagrange geometry for degree %i %s not yet implemented. \n", *degree,
-                 t8_eclass_to_string[active_tree_class]);
+      SC_ABORTF ("Error: Lagrange geometry for degree %i %s not yet implemented. \n", *active_degree(),
+                 t8_eclass_to_string[active_tree_class()]);
     }
 
   case T8_ECLASS_TRIANGLE:
-    switch (*degree) {
+    switch (*active_degree()) {
     case 1:
       return t8_geometry_lagrange::t8_geom_t3_basis (ref_coords);
     case 2:
       return t8_geometry_lagrange::t8_geom_t6_basis (ref_coords);
     default:
-      SC_ABORTF ("Error: Lagrange geometry for degree %i %s not yet implemented. \n", *degree,
-                 t8_eclass_to_string[active_tree_class]);
+      SC_ABORTF ("Error: Lagrange geometry for degree %i %s not yet implemented. \n", *active_degree(),
+                 t8_eclass_to_string[active_tree_class()]);
     }
   case T8_ECLASS_QUAD:
-    switch (*degree) {
+    switch (*active_degree()) {
     case 1:
       return t8_geometry_lagrange::t8_geom_q4_basis (ref_coords);
     case 2:
       return t8_geometry_lagrange::t8_geom_q9_basis (ref_coords);
     default:
-      SC_ABORTF ("Error: Lagrange geometry for degree %i %s not yet implemented. \n", *degree,
-                 t8_eclass_to_string[active_tree_class]);
+      SC_ABORTF ("Error: Lagrange geometry for degree %i %s not yet implemented. \n", *active_degree(),
+                 t8_eclass_to_string[active_tree_class()]);
     }
   case T8_ECLASS_HEX:
-    switch (*degree) {
+    switch (*active_degree()) {
     case 1:
       return t8_geometry_lagrange::t8_geom_h8_basis (ref_coords);
     case 2:
       return t8_geometry_lagrange::t8_geom_h27_basis (ref_coords);
     default:
-      SC_ABORTF ("Error: Lagrange geometry for degree %i %s not yet implemented. \n", *degree,
-                 t8_eclass_to_string[active_tree_class]);
+      SC_ABORTF ("Error: Lagrange geometry for degree %i %s not yet implemented. \n", *active_degree(),
+                 t8_eclass_to_string[active_tree_class()]);
     }
   default:
     SC_ABORTF ("Error: Lagrange geometry for eclass %s not yet implemented. \n",
-               t8_eclass_to_string[active_tree_class]);
+               t8_eclass_to_string[active_tree_class()]);
   }
 }
 
 bool
 t8_geometry_lagrange::t8_geom_check_tree_compatibility () const
 {
-  if (*degree > T8_GEOMETRY_MAX_POLYNOMIAL_DEGREE) {
+  if (*active_degree() > T8_GEOMETRY_MAX_POLYNOMIAL_DEGREE) {
     t8_debugf ("Lagrange tree with degree %i detected.\n"
                "Only degrees up to %i are supported.",
-               *degree, T8_GEOMETRY_MAX_POLYNOMIAL_DEGREE);
+               *active_degree(), T8_GEOMETRY_MAX_POLYNOMIAL_DEGREE);
     return false;
   }
-  if (active_tree_class != T8_ECLASS_LINE && active_tree_class != T8_ECLASS_TRIANGLE
-      && active_tree_class != T8_ECLASS_QUAD && active_tree_class != T8_ECLASS_HEX) {
+  if (active_tree_class() != T8_ECLASS_LINE && active_tree_class() != T8_ECLASS_TRIANGLE
+      && active_tree_class() != T8_ECLASS_QUAD && active_tree_class() != T8_ECLASS_HEX) {
     t8_debugf ("Lagrange tree with class %i detected.\n"
                "Only lines, triangles, quadrilaterals and hexahedra are supported with the lagrangian geometry.\n",
-               active_tree_class);
+               active_tree_class());
     return false;
   }
   return true;

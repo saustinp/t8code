@@ -35,6 +35,8 @@ t8_geometry_analytic::t8_geometry_analytic (std::string name, t8_geom_analytic_f
   tree_negative_volume = tree_negative_volume_in;
   tree_compatible = tree_compatible_in;
   user_data = user_data_in;
+  /* tree_data is now in the t8_geometry base class's per-thread
+   * TLSEntry cache; no instance-member init needed. */
 }
 
 t8_geometry_analytic::t8_geometry_analytic (std::string name): t8_geometry (name)
@@ -45,6 +47,8 @@ t8_geometry_analytic::t8_geometry_analytic (std::string name): t8_geometry (name
   tree_negative_volume = NULL;
   tree_compatible = NULL;
   user_data = NULL;
+  /* tree_data is now in the t8_geometry base class's per-thread
+   * TLSEntry cache; no instance-member init needed. */
 }
 
 void
@@ -52,7 +56,7 @@ t8_geometry_analytic::t8_geom_evaluate (t8_cmesh_t cmesh, t8_gloidx_t gtreeid, c
                                         const size_t num_coords, double *out_coords) const
 {
   T8_ASSERT (analytical_function != NULL);
-  analytical_function (cmesh, gtreeid, ref_coords, num_coords, out_coords, tree_data, user_data);
+  analytical_function (cmesh, gtreeid, ref_coords, num_coords, out_coords, active_tree_data (), user_data);
 }
 
 void
@@ -60,20 +64,20 @@ t8_geometry_analytic::t8_geom_evaluate_jacobian (t8_cmesh_t cmesh, t8_gloidx_t g
                                                  const size_t num_coords, double *jacobian_out) const
 {
   T8_ASSERT (jacobian != NULL);
-  jacobian (cmesh, gtreeid, ref_coords, num_coords, jacobian_out, tree_data, user_data);
+  jacobian (cmesh, gtreeid, ref_coords, num_coords, jacobian_out, active_tree_data (), user_data);
 }
 
 void
 t8_geometry_analytic::t8_geom_load_tree_data (t8_cmesh_t cmesh, t8_gloidx_t gtreeid)
 {
+  const void *td_local = NULL;
   if (load_tree_data != NULL) {
-    /* Load tree data if a loading function was provided. */
-    load_tree_data (cmesh, gtreeid, &tree_data);
+    /* Load tree data if a loading function was provided. The caller
+     * writes the data pointer through &td_local (a stack-local); we
+     * then publish that into this thread's TLSEntry via the setter. */
+    load_tree_data (cmesh, gtreeid, &td_local);
   }
-  else {
-    /* Otherwise it is NULL. */
-    tree_data = NULL;
-  }
+  set_active_tree_data (td_local);
 }
 
 bool

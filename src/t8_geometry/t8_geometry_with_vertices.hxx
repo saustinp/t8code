@@ -49,11 +49,15 @@ struct t8_geometry_with_vertices: public t8_geometry
  public:
   /** Basic constructor that sets the name.
    * \param [in] name The name of the geometry. Used to distinct the geometry from other geometries.
+   *
+   * NOTE (thread-safety refactor): the active_tree / active_tree_vertices
+   * "currently loaded tree" state is now per-thread cache (see TLSEntry
+   * in t8_geometry_base.hxx). Each thread's cache is lazily initialized
+   * to the zero state on first access via the generation-counter
+   * mismatch — no constructor action needed.
    */
   t8_geometry_with_vertices (std::string name): t8_geometry (name)
   {
-    active_tree_vertices = NULL;
-    active_tree = -1;
   }
 
   /* Base constructor with no arguments. We need this since it
@@ -61,8 +65,6 @@ struct t8_geometry_with_vertices: public t8_geometry
    * Sets the name to an invalid value. */
   t8_geometry_with_vertices (): t8_geometry_with_vertices ("Invalid")
   {
-    active_tree_vertices = NULL;
-    active_tree = -1;
   }
 
   /** The destructor. It does nothing but has to be defined since
@@ -103,7 +105,12 @@ struct t8_geometry_with_vertices: public t8_geometry
   };
 
  protected:
-  const double* active_tree_vertices; /**< The vertices of the currently active tree. */
+  /* Note: the former `active_tree_vertices` instance member has been
+   * moved into the t8_geometry base class's per-thread TLSEntry cache.
+   * Derived classes that previously read this field directly should
+   * now call active_tree_vertices() (the protected accessor inherited
+   * from t8_geometry). Writes happen via set_active_tree_vertices(),
+   * called by this class's t8_geom_load_tree_data. */
 };
 
 T8_EXTERN_C_END ();

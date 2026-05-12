@@ -61,8 +61,8 @@ t8_geometry_linear_axis_aligned::t8_geom_evaluate ([[maybe_unused]] t8_cmesh_t c
                                                    [[maybe_unused]] t8_gloidx_t gtreeid, const double *ref_coords,
                                                    const size_t num_coords, double *out_coords) const
 {
-  T8_ASSERT (correct_point_order (active_tree_vertices));
-  t8_geom_compute_linear_axis_aligned_geometry (active_tree_class, active_tree_vertices, ref_coords, num_coords,
+  T8_ASSERT (correct_point_order (active_tree_vertices()));
+  t8_geom_compute_linear_axis_aligned_geometry (active_tree_class(), active_tree_vertices(), ref_coords, num_coords,
                                                 out_coords);
 }
 
@@ -114,7 +114,7 @@ t8_geometry_linear_axis_aligned::t8_geom_point_batch_inside_element (t8_forest_t
 bool
 t8_geometry_linear_axis_aligned::t8_geom_tree_negative_volume () const
 {
-  T8_ASSERT (correct_point_order (active_tree_vertices));
+  T8_ASSERT (correct_point_order (active_tree_vertices()));
   return false;
 }
 

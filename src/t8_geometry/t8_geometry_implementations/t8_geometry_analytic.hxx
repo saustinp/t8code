@@ -178,8 +178,11 @@ struct t8_geometry_analytic: public t8_geometry
 
   t8_geom_tree_compatible_fn tree_compatible; /**< The function to check if a tree is compatible. */
 
-  const void *tree_data; /** Tree data pointer that can be set in \a load_tree_data and
-                             is passed onto \a analytical_function and \a jacobian. */
+  /* Note: the former `tree_data` instance member (per-tree data
+   * pointer set by load_tree_data and passed to analytical_function /
+   * jacobian) has been moved into the t8_geometry base class's
+   * per-thread TLSEntry cache. Readers use `active_tree_data()`;
+   * the load_tree_data override writes via `set_active_tree_data(...)`. */
 
   const void *user_data; /** Additional user data pointer that can be set in constructor
                              and modified via \ref t8_geom_analytic_get_user_data. */

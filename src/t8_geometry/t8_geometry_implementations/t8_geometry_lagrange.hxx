@@ -307,8 +307,13 @@ struct t8_geometry_lagrange: public t8_geometry_with_vertices
   inline std::vector<double>
   t8_geom_h27_basis (const double *ref_point) const;
 
-  /** Polynomial degree of the interpolation. */
-  const int *degree;
+  /* Note: polynomial degree of the current tree was an instance member
+   * (`const int *degree`). It has been moved into the t8_geometry base
+   * class's per-thread TLSEntry cache to remove the cross-tree race
+   * surfaced by the t8 thread-safety microbench. Readers should call
+   * the inherited accessor `active_degree()`; writers should call
+   * `set_active_degree(...)` (currently only t8_geom_load_tree_data
+   * does so in this class). */
 };
 
 /**

@@ -43,7 +43,7 @@ void
 t8_geometry_linear::t8_geom_evaluate ([[maybe_unused]] t8_cmesh_t cmesh, [[maybe_unused]] t8_gloidx_t gtreeid,
                                       const double *ref_coords, const size_t num_coords, double *out_coords) const
 {
-  t8_geom_compute_linear_geometry (active_tree_class, active_tree_vertices, ref_coords, num_coords, out_coords);
+  t8_geom_compute_linear_geometry (active_tree_class(), active_tree_vertices(), ref_coords, num_coords, out_coords);
 }
 
 void
@@ -250,26 +250,26 @@ inline bool
 t8_geometry_linear::get_tree_bounding_box ([[maybe_unused]] const t8_cmesh_t cmesh, double bounds[6]) const
 {
   T8_ASSERT (cmesh != NULL);
-  T8_ASSERT (active_tree_vertices != NULL);
+  T8_ASSERT (active_tree_vertices() != NULL);
   /* For linear geometry the bounding box is determined by the minimum/maximum occurring
    * vertex coordinates. */
   /* Set bounds to the first vertex */
-  bounds[0] = active_tree_vertices[0];
-  bounds[1] = active_tree_vertices[0];
-  bounds[2] = active_tree_vertices[1];
-  bounds[3] = active_tree_vertices[1];
-  bounds[4] = active_tree_vertices[2];
-  bounds[5] = active_tree_vertices[2];
-  const int num_vertices = t8_eclass_num_vertices[active_tree_class];
+  bounds[0] = active_tree_vertices()[0];
+  bounds[1] = active_tree_vertices()[0];
+  bounds[2] = active_tree_vertices()[1];
+  bounds[3] = active_tree_vertices()[1];
+  bounds[4] = active_tree_vertices()[2];
+  bounds[5] = active_tree_vertices()[2];
+  const int num_vertices = t8_eclass_num_vertices[active_tree_class()];
   T8_ASSERT (num_vertices > 0);
   /* iterate over all vertices in the tree and update bounds */
   for (int ivertex = 1; ivertex < num_vertices; ++ivertex) {
-    bounds[0] = std::min (bounds[0], active_tree_vertices[3 * ivertex]);
-    bounds[1] = std::max (bounds[1], active_tree_vertices[3 * ivertex]);
-    bounds[2] = std::min (bounds[2], active_tree_vertices[3 * ivertex + 1]);
-    bounds[3] = std::max (bounds[3], active_tree_vertices[3 * ivertex + 1]);
-    bounds[4] = std::min (bounds[4], active_tree_vertices[3 * ivertex + 2]);
-    bounds[5] = std::max (bounds[5], active_tree_vertices[3 * ivertex + 2]);
+    bounds[0] = std::min (bounds[0], active_tree_vertices()[3 * ivertex]);
+    bounds[1] = std::max (bounds[1], active_tree_vertices()[3 * ivertex]);
+    bounds[2] = std::min (bounds[2], active_tree_vertices()[3 * ivertex + 1]);
+    bounds[3] = std::max (bounds[3], active_tree_vertices()[3 * ivertex + 1]);
+    bounds[4] = std::min (bounds[4], active_tree_vertices()[3 * ivertex + 2]);
+    bounds[5] = std::max (bounds[5], active_tree_vertices()[3 * ivertex + 2]);
   }
   return true;
 }

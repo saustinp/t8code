@@ -30,11 +30,15 @@
 
 #include <t8.h>
 #include <t8_cmesh/t8_cmesh.h>
+#include <t8_eclass/t8_eclass.h>
 #include <t8_forest/t8_forest.h>
 #include <t8_geometry/t8_geometry.h>
 #include <t8_geometry/t8_geometry_hash.hxx>
 
+#include <atomic>
+#include <cstdint>
 #include <functional>
+#include <unordered_map>
 
 T8_EXTERN_C_BEGIN ();
 
@@ -49,8 +53,17 @@ struct t8_geometry
  public:
   /** Basic constructor that sets the name.
    * \param [in] name The name of the geometry. Used to distinct the geometry from other geometries.
+   *
+   * Assigns a unique monotonic \a instance_id_ from the global atomic
+   * counter. This id is the generation key for the per-thread cache
+   * of "currently loaded tree data" (see \ref geom_tls): each thread's
+   * cache entry for this geometry remembers the id it was populated
+   * for, and any mismatch on lookup means the cache is stale and
+   * must be re-initialized.
   */
-  t8_geometry (std::string name): name (name), hash (t8_geometry_compute_hash (name))
+  t8_geometry (std::string name)
+    : name (name), hash (t8_geometry_compute_hash (name)),
+      instance_id_ (next_instance_id_.fetch_add (1, std::memory_order_relaxed) + 1)
   {
     if (t8_geometry_hash_is_null (hash)) {
       SC_ABORTF ("Registering geometry with invalid name\"%s\"\n.", name.c_str ());
@@ -203,10 +216,181 @@ struct t8_geometry
     = 0;
 
  protected:
-  std::string name;              /**< The name of this geometry. */
-  t8_geometry_hash hash;         /**< The hash of the name of this geometry. See also \ref t8_geometry_compute_hash */
-  t8_gloidx_t active_tree;       /**< The tree of which currently vertices are loaded. */
-  t8_eclass_t active_tree_class; /**< The class of the currently active tree. */
+  std::string name;      /**< The name of this geometry. */
+  t8_geometry_hash hash; /**< The hash of the name of this geometry. See also \ref t8_geometry_compute_hash */
+
+  /**
+   * Per-thread cache entry for this geometry. Holds the "currently
+   * loaded tree" state that was previously stored as instance members
+   * (active_tree, active_tree_class) plus the derived-class caches
+   * (active_tree_vertices in t8_geometry_with_vertices, degree in
+   * t8_geometry_lagrange, edges/faces in t8_geometry_cad, tree_data
+   * in t8_geometry_analytic). Combined into a single struct so the
+   * TLS cache map only needs one entry per (thread × geometry),
+   * regardless of which derived type.
+   *
+   * Cache is generation-checked: \a generation is the snapshot of the
+   * geometry's \a instance_id_ at the time this entry was populated.
+   * A mismatch on lookup means the entry is stale (either from a
+   * destroyed geometry whose address was reused, or from before a
+   * \ref deactivate_tree-style invalidation). Stale entries are
+   * lazily re-initialized to zero state on next access.
+   */
+  struct TLSEntry
+  {
+    uint64_t generation = 0;
+    /* Base-class state (formerly t8_geometry::active_tree/_class). */
+    t8_gloidx_t active_tree = -1;
+    t8_eclass_t active_tree_class = T8_ECLASS_INVALID;
+    /* t8_geometry_with_vertices state (formerly active_tree_vertices). */
+    const double *active_tree_vertices = nullptr;
+    /* Derived-class-specific caches. Only one is populated for any
+     * given geometry instance — they're combined here so the TLS map
+     * doesn't need separate entries per derived-class subtype. */
+    const int *active_degree = nullptr;     /**< t8_geometry_lagrange */
+    const int *active_edges = nullptr;      /**< t8_geometry_cad */
+    const int *active_faces = nullptr;      /**< t8_geometry_cad */
+    const void *active_tree_data = nullptr; /**< t8_geometry_analytic */
+  };
+
+  /**
+   * Get (lazily creating, generation-validating) this thread's cache
+   * entry for this geometry instance. Marked \c const because the
+   * geometry is logically unchanged — the only mutation is to the
+   * thread-local cache, which is per-thread external state.
+   */
+  inline TLSEntry &
+  geom_tls () const noexcept
+  {
+    TLSEntry &e = tls_cache_[this];
+    if (e.generation != instance_id_) {
+      e.generation = instance_id_;
+      e.active_tree = -1;
+      e.active_tree_class = T8_ECLASS_INVALID;
+      e.active_tree_vertices = nullptr;
+      e.active_degree = nullptr;
+      e.active_edges = nullptr;
+      e.active_faces = nullptr;
+      e.active_tree_data = nullptr;
+    }
+    return e;
+  }
+
+  /* ── Accessor methods replacing the former instance members ──────
+   *
+   * Naming convention: same as the old field names, suffixed with ()
+   * to mark them as accessor calls. This way derived-class
+   * conversions are mechanical (`active_tree_class` -> `active_tree_class()`).
+   *
+   * Const-qualified so they're callable from const member functions
+   * like t8_geom_evaluate. Internal mutation of the thread-local
+   * cache is fine despite the const qualifier — TLS is per-thread
+   * external state, not part of the geometry's observable instance
+   * state.
+   */
+  inline t8_gloidx_t
+  active_tree () const noexcept
+  {
+    return geom_tls ().active_tree;
+  }
+  inline t8_eclass_t
+  active_tree_class () const noexcept
+  {
+    return geom_tls ().active_tree_class;
+  }
+  inline const double *
+  active_tree_vertices () const noexcept
+  {
+    return geom_tls ().active_tree_vertices;
+  }
+  inline const int *
+  active_degree () const noexcept
+  {
+    return geom_tls ().active_degree;
+  }
+  inline const int *
+  active_edges () const noexcept
+  {
+    return geom_tls ().active_edges;
+  }
+  inline const int *
+  active_faces () const noexcept
+  {
+    return geom_tls ().active_faces;
+  }
+  inline const void *
+  active_tree_data () const noexcept
+  {
+    return geom_tls ().active_tree_data;
+  }
+
+  /* ── Setters used by t8_geom_load_tree_data implementations ────── */
+  inline void
+  set_active_tree (t8_gloidx_t v) const noexcept
+  {
+    geom_tls ().active_tree = v;
+  }
+  inline void
+  set_active_tree_class (t8_eclass_t v) const noexcept
+  {
+    geom_tls ().active_tree_class = v;
+  }
+  inline void
+  set_active_tree_vertices (const double *v) const noexcept
+  {
+    geom_tls ().active_tree_vertices = v;
+  }
+  inline void
+  set_active_degree (const int *v) const noexcept
+  {
+    geom_tls ().active_degree = v;
+  }
+  inline void
+  set_active_edges (const int *v) const noexcept
+  {
+    geom_tls ().active_edges = v;
+  }
+  inline void
+  set_active_faces (const int *v) const noexcept
+  {
+    geom_tls ().active_faces = v;
+  }
+  inline void
+  set_active_tree_data (const void *v) const noexcept
+  {
+    geom_tls ().active_tree_data = v;
+  }
+
+ private:
+  /**
+   * Per-thread cache of TLSEntry, keyed by geometry-instance pointer.
+   * Static, so one map per thread (not per (thread × geometry)). The
+   * map grows by one entry per (thread, geometry instance ever
+   * accessed by that thread). Stale entries from destroyed geometries
+   * are detected by the generation-counter mismatch on lookup.
+   */
+  static thread_local std::unordered_map<const t8_geometry *, TLSEntry> tls_cache_;
+
+  /**
+   * Global atomic counter that hands out monotonic unique
+   * \a instance_id_ values. Starts at 0; constructor uses
+   * fetch_add+1 so the first geometry gets instance_id_=1 (leaves 0
+   * as the "uninitialized" sentinel for TLSEntry::generation).
+   */
+  static std::atomic<uint64_t> next_instance_id_;
+
+  /**
+   * Generation token assigned at construction. The per-thread cache
+   * uses this to detect stale entries: if the cached generation
+   * doesn't match this value, the entry was either populated by a
+   * different (now-destroyed) geometry instance at this address, OR
+   * the instance was invalidated by a state change. The latter
+   * mechanism isn't currently used at the t8_geometry level (no
+   * deactivate-style API at this layer), but is reserved for future
+   * use if e.g. derived classes need to invalidate caches on
+   * structural changes.
+   */
+  uint64_t instance_id_;
 };
 
 T8_EXTERN_C_END ();
