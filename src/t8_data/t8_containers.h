@@ -41,12 +41,38 @@
  */
 typedef struct
 {
-  /** 
+  /**
    * The scheme of which elements should be stored.
    */
   const t8_scheme_c *scheme; /**!< A scheme of which elements should be stored */
   t8_eclass_t tree_class;    /**!< The tree class of the elements stored in the array */
   sc_array_t array;          /**!< The array in which the elements are stored */
+
+  /** Optional linear_id cache for accelerating t8_forest_bin_search_lower.
+   *
+   * Populated lazily on demand by the caller (typically the t8_forest hot path
+   * that needs to do many binary searches against this array). When populated
+   * the cache holds the t8_linearidx_t value of element[i] at level
+   * `linear_id_cache_level`, for i in [0, linear_id_cache_count). Readers
+   * (such as the cached path in t8_forest_bin_search_lower) check freshness
+   * via three predicates simultaneously:
+   *
+   *   linear_id_cache != NULL
+   *   AND  linear_id_cache_level == requested_level
+   *   AND  linear_id_cache_count == array.elem_count
+   *
+   * A mismatch on any predicate is treated as "no cache present" and
+   * readers fall back to the scalar recomputation path.
+   *
+   * Mutators that change the element count (resize, push, push_count, copy,
+   * reset, truncate) auto-invalidate the cache (free the memory + clear
+   * fields). In-place element mutations via the `_mutable` accessors do NOT
+   * auto-invalidate — callers performing such mutations are responsible for
+   * calling \ref t8_element_array_invalidate_linear_id_cache themselves. In
+   * practice this is rare: t8 leaf arrays are read-only after forest commit. */
+  t8_linearidx_t *linear_id_cache; /**!< NULL when cache is not populated. */
+  int linear_id_cache_level;       /**!< Level at which the cache was filled; -1 = invalid. */
+  size_t linear_id_cache_count;    /**!< Entry count in cache; must == array.elem_count to be fresh. */
 } t8_element_array_t;
 
 T8_EXTERN_C_BEGIN ();
@@ -281,6 +307,29 @@ t8_element_array_reset (t8_element_array_t *element_array);
  */
 void
 t8_element_array_truncate (t8_element_array_t *element_array);
+
+/** Invalidate the linear_id cache (if any) attached to the array.
+ * Frees cache memory and resets the cache fields to "not populated".
+ * Idempotent and safe to call on an array whose cache was never populated.
+ * \param [in,out] element_array  The array whose cache should be cleared. */
+void
+t8_element_array_invalidate_linear_id_cache (t8_element_array_t *element_array);
+
+/** Get a read-only pointer to the linear_id cache if it is FRESH for the
+ * given level, else NULL.
+ *
+ * "Fresh" means all three of:
+ *   - linear_id_cache != NULL  (cache has been populated at least once)
+ *   - linear_id_cache_level == level  (populated at the right level)
+ *   - linear_id_cache_count == array.elem_count  (no mutation since fill)
+ *
+ * \param [in] element_array  The array to inspect.
+ * \param [in] level          The level at which the caller wants linear IDs.
+ * \return                    Pointer to an array of `array.elem_count`
+ *                            t8_linearidx_t values, or NULL if the cache
+ *                            is missing/stale/mismatched. */
+const t8_linearidx_t *
+t8_element_array_get_linear_id_cache (const t8_element_array_t *element_array, int level);
 
 T8_EXTERN_C_END ();
 

@@ -53,6 +53,17 @@ t8_element_array_is_valid (const t8_element_array_t *element_array)
 }
 #endif
 
+/* Internal: zero-initialize the linear_id cache fields. Called by every
+ * init-like function so a freshly-constructed array always starts with a
+ * known "not populated" cache. */
+static inline void
+t8_element_array_init_linear_id_cache_fields (t8_element_array_t *element_array)
+{
+  element_array->linear_id_cache = NULL;
+  element_array->linear_id_cache_level = -1;
+  element_array->linear_id_cache_count = 0;
+}
+
 t8_element_array_t *
 t8_element_array_new (const t8_scheme_c *scheme, const t8_eclass_t tree_class)
 {
@@ -90,6 +101,8 @@ t8_element_array_init (t8_element_array_t *element_array, const t8_scheme_c *sch
   /* get the size of an element and initialize the array member */
   const size_t elem_size = scheme->get_element_size (tree_class);
   sc_array_init (&element_array->array, elem_size);
+  /* Mark linear_id cache as not populated. */
+  t8_element_array_init_linear_id_cache_fields (element_array);
   T8_ASSERT (t8_element_array_is_valid (element_array));
 }
 
@@ -110,6 +123,8 @@ t8_element_array_init_size (t8_element_array_t *element_array, const t8_scheme_c
     first_element = (t8_element_t *) sc_array_index (&element_array->array, 0);
     scheme->element_init (tree_class, num_elements, first_element);
   }
+  /* Mark linear_id cache as not populated. */
+  t8_element_array_init_linear_id_cache_fields (element_array);
   T8_ASSERT (t8_element_array_is_valid (element_array));
 }
 
@@ -126,6 +141,9 @@ t8_element_array_init_view (t8_element_array_t *view, const t8_element_array_t *
   /* Set the scheme */
   view->scheme = array->scheme;
   view->tree_class = array->tree_class;
+  /* A view does NOT inherit the parent's cache (its elements are a subrange).
+   * The view's own cache fields start in the "not populated" state. */
+  t8_element_array_init_linear_id_cache_fields (view);
   T8_ASSERT (t8_element_array_is_valid (view));
 }
 
@@ -138,6 +156,8 @@ t8_element_array_init_data (t8_element_array_t *view, const t8_element_t *base, 
   /* set the scheme */
   view->scheme = scheme;
   view->tree_class = tree_class;
+  /* External-data view: caller owns data; cache starts not populated. */
+  t8_element_array_init_linear_id_cache_fields (view);
   T8_ASSERT (t8_element_array_is_valid (view));
 }
 
@@ -177,6 +197,10 @@ t8_element_array_resize (t8_element_array_t *element_array, const size_t new_cou
   size_t old_count;
   const t8_eclass_t tree_class = element_array->tree_class;
   T8_ASSERT (t8_element_array_is_valid (element_array));
+  /* Linear_id cache is invalidated on any size change. Drop it eagerly to
+   * release memory and avoid a stale-cache risk if a future code path
+   * inspects fields rather than going through get_linear_id_cache. */
+  t8_element_array_invalidate_linear_id_cache (element_array);
   /* Store the old number of elements */
   old_count = t8_element_array_get_count (element_array);
   if (old_count < new_count) {
@@ -209,6 +233,8 @@ t8_element_array_copy (t8_element_array_t *dest, const t8_element_array_t *src)
   T8_ASSERT (t8_element_array_is_valid (dest));
   T8_ASSERT (t8_element_array_is_valid (src));
   T8_ASSERT (dest->scheme == src->scheme);
+  /* Destination contents change wholesale; any cache it had is now stale. */
+  t8_element_array_invalidate_linear_id_cache (dest);
   sc_array_copy (&dest->array, (sc_array_t *) &src->array); /* need to convert src->array to non-const */
 }
 
@@ -217,6 +243,8 @@ t8_element_array_push (t8_element_array_t *element_array)
 {
   t8_element_t *new_element;
   T8_ASSERT (t8_element_array_is_valid (element_array));
+  /* Size grows; cache count would no longer match — invalidate. */
+  t8_element_array_invalidate_linear_id_cache (element_array);
   new_element = (t8_element_t *) sc_array_push (&element_array->array);
   element_array->scheme->element_init (element_array->tree_class, 1, new_element);
   return new_element;
@@ -227,6 +255,8 @@ t8_element_array_push_count (t8_element_array_t *element_array, const size_t cou
 {
   t8_element_t *new_elements;
   T8_ASSERT (t8_element_array_is_valid (element_array));
+  /* Size grows; cache count would no longer match — invalidate. */
+  t8_element_array_invalidate_linear_id_cache (element_array);
   /* grow the array */
   new_elements = (t8_element_t *) sc_array_push_count (&element_array->array, count);
   /* initialize the elements */
@@ -330,6 +360,8 @@ void
 t8_element_array_reset (t8_element_array_t *element_array)
 {
   T8_ASSERT (t8_element_array_is_valid (element_array));
+  /* Cache becomes irrelevant — drop it eagerly. */
+  t8_element_array_invalidate_linear_id_cache (element_array);
   const size_t count = t8_element_array_get_count (element_array);
   if (count > 0) {
     t8_element_t *first_elem = t8_element_array_index_locidx_mutable (element_array, 0);
@@ -342,12 +374,40 @@ void
 t8_element_array_truncate (t8_element_array_t *element_array)
 {
   T8_ASSERT (t8_element_array_is_valid (element_array));
+  /* Element-count goes to zero, mismatching the cache count; invalidate. */
+  t8_element_array_invalidate_linear_id_cache (element_array);
   const size_t count = t8_element_array_get_count (element_array);
   if (count > 0) {
     t8_element_t *first_elem = t8_element_array_index_locidx_mutable (element_array, 0);
     element_array->scheme->element_deinit (element_array->tree_class, count, first_elem);
   }
   sc_array_truncate (&element_array->array);
+}
+
+void
+t8_element_array_invalidate_linear_id_cache (t8_element_array_t *element_array)
+{
+  if (element_array == NULL) {
+    return;
+  }
+  if (element_array->linear_id_cache != NULL) {
+    T8_FREE (element_array->linear_id_cache);
+    element_array->linear_id_cache = NULL;
+  }
+  element_array->linear_id_cache_level = -1;
+  element_array->linear_id_cache_count = 0;
+}
+
+const t8_linearidx_t *
+t8_element_array_get_linear_id_cache (const t8_element_array_t *element_array, int level)
+{
+  T8_ASSERT (t8_element_array_is_valid (element_array));
+  /* Three-predicate freshness check. Any single mismatch yields NULL,
+   * forcing the caller (typically bin_search_lower) onto the scalar path. */
+  if (element_array->linear_id_cache == NULL) return NULL;
+  if (element_array->linear_id_cache_level != level) return NULL;
+  if (element_array->linear_id_cache_count != element_array->array.elem_count) return NULL;
+  return element_array->linear_id_cache;
 }
 
 T8_EXTERN_C_END ();
