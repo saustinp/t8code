@@ -293,6 +293,39 @@ t8_dtri_is_ancestor (const t8_dtri_t *element, const t8_dtri_t *child);
 t8_linearidx_t
 t8_dtri_linear_id (const t8_dtri_t *element, int level);
 
+/** Batched form of t8_dtri_linear_id: computes the linear positions of
+ *  \a n_elements triangles in a single call.
+ *
+ *  Semantically equivalent to calling \ref t8_dtri_linear_id once per
+ *  element. Bit-equal output to the scalar form in all cases.
+ *
+ *  Internally the function transposes inputs to a Structure-of-Arrays
+ *  layout in stack-allocated scratch buffers (sized to fit comfortably in
+ *  L1d), then runs the per-level accumulation as an inner loop across
+ *  elements. This loop is SIMD-friendly: it has no loop-carried
+ *  dependency across the element axis and is annotated with
+ *  `#pragma omp simd` so compilers can vectorize it where supported.
+ *
+ *  The function is useful when the caller needs the linear IDs of many
+ *  elements (e.g. precomputing a comparator cache for a binary search),
+ *  amortizing both compute_type setup and per-call overhead across the
+ *  batch.
+ *
+ *  \param [in]  elements    Array of \a n_elements pointers to triangles.
+ *                            Each pointer must be non-null and refer to a
+ *                            triangle with 0 <= level <= T8_DTRI_MAXLEVEL.
+ *                            The pointed-to triangles need not be contiguous
+ *                            in memory.
+ *  \param [in]  n_elements  Number of triangles to process. May be zero.
+ *  \param [in]  level       Target level for the linear ID. Must satisfy
+ *                            0 <= level <= T8_DTRI_MAXLEVEL.
+ *  \param [out] ids_out     Array of length \a n_elements. On return,
+ *                            ids_out[i] holds the linear ID of
+ *                            elements[i] at \a level.
+ */
+void
+t8_dtri_linear_id_batch (const t8_dtri_t **elements, size_t n_elements, int level, t8_linearidx_t *ids_out);
+
 /**
  * Same as init_linear_id, but we only consider the subtree. Used for computing the index of a tetrahedron lying in a 
  * pyramid

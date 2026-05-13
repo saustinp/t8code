@@ -1493,6 +1493,186 @@ t8_dtri_linear_id (const t8_dtri_t *element, int level)
   return id;
 }
 
+/* Batched form of t8_dtri_linear_id.
+ *
+ * Semantically: ids_out[i] = t8_dtri_linear_id(elements[i], level), for i in [0, n).
+ *
+ * Implementation strategy:
+ *   1. Transpose AoS inputs into SoA scratch arrays in chunks of T8_DTRI_LINEAR_ID_BATCH_SIZE
+ *      so all per-element state (x, y, level, type, plus per-element state machine
+ *      registers `type_cur`, `exponent`, `eff_level`, `id`) lives on the stack and the
+ *      working set fits in L1d.
+ *   2. Run a per-element init loop that handles BOTH branches of the scalar
+ *      `if (level > my_level)` decision. This loop also computes the per-element
+ *      `eff_level` (analogue of scalar's mutated `level`) and the descending
+ *      `compute_type` walk where applicable.
+ *   3. Track `max_eff_level` across the chunk. The main accumulation phase runs
+ *      a single outer loop over levels from `max_eff_level` down to 1, with an
+ *      inner loop across elements. Each lane is masked active when its
+ *      `eff_level` >= the current outer level — equivalent to scalar's per-element
+ *      `for (i = eff_level; i > 0; i--)` but with a uniform iteration count
+ *      across lanes so the inner loop is SIMD-vectorizable.
+ *   4. The inner loop body is annotated `#pragma omp simd`. It contains only
+ *      bitwise ops on per-lane state, two LUT gathers (Iloc, parenttype), and a
+ *      per-lane variable shift — all SIMD-able on AVX2+ with vpgatherq+vpsllvq.
+ *
+ * Correctness vs scalar — load-bearing invariants (verified against scalar in the
+ * companion `t8_dtri_linear_id_batch_self_test` build target):
+ *   - For each lane, the SAME cids are computed in the SAME order (descending
+ *     level) as scalar's for-loop.
+ *   - The Iloc-OR-into-id step uses the SAME `type_cur` value (the BEFORE-update
+ *     one) that scalar uses on each iteration.
+ *   - `exponent` is initialized to the SAME starting value and incremented by
+ *     T8_DTRI_DIM the SAME number of times (eff_level times).
+ *   - The compute_type branch's loop runs the SAME range (my_level down to level+1).
+ *   - Edge cases (level == 0; level > my_level; level == my_level) are
+ *     dispatched the same way as scalar.
+ */
+#ifndef T8_DTRI_LINEAR_ID_BATCH_SIZE
+/* Chunk size for the SoA scratch. Sized so the working set (~10 × BATCH bytes
+ * of int32 / int8 / int / linearidx_t arrays = ~2 KB at BATCH=64) fits
+ * comfortably in L1d on any modern x86. Larger chunks amortize the SoA transpose
+ * better but waste L1; smaller chunks reduce vectorization benefit. 64 is a
+ * conservative sweet spot. */
+#define T8_DTRI_LINEAR_ID_BATCH_SIZE 64
+#endif
+
+void
+t8_dtri_linear_id_batch (const t8_dtri_t **elements, size_t n_elements, int level, t8_linearidx_t *ids_out)
+{
+  T8_ASSERT (0 <= level && level <= T8_DTRI_MAXLEVEL);
+  T8_ASSERT (n_elements == 0 || elements != NULL);
+  T8_ASSERT (n_elements == 0 || ids_out != NULL);
+
+  if (n_elements == 0) {
+    return;
+  }
+
+  /* Stack scratch sized to T8_DTRI_LINEAR_ID_BATCH_SIZE. The chunked loop below
+   * processes the input in slices of up to BATCH elements at a time. */
+  const size_t BATCH = T8_DTRI_LINEAR_ID_BATCH_SIZE;
+
+  t8_dtri_coord_t xs[T8_DTRI_LINEAR_ID_BATCH_SIZE];
+  t8_dtri_coord_t ys[T8_DTRI_LINEAR_ID_BATCH_SIZE];
+#ifdef T8_DTRI_TO_DTET
+  t8_dtri_coord_t zs[T8_DTRI_LINEAR_ID_BATCH_SIZE];
+#endif
+  /* my_level, types_init are stored 8-bit-narrow; types_cur is 8-bit because the
+   * parenttype LUT returns int8_t and 2D triangle types are {0, 1}. */
+  int8_t my_levels[T8_DTRI_LINEAR_ID_BATCH_SIZE];
+  int8_t types_init[T8_DTRI_LINEAR_ID_BATCH_SIZE];
+  int8_t types_cur[T8_DTRI_LINEAR_ID_BATCH_SIZE];
+  int eff_levels[T8_DTRI_LINEAR_ID_BATCH_SIZE];
+  int exponents[T8_DTRI_LINEAR_ID_BATCH_SIZE];
+  t8_linearidx_t ids[T8_DTRI_LINEAR_ID_BATCH_SIZE];
+
+  for (size_t e_base = 0; e_base < n_elements; e_base += BATCH) {
+    const size_t remaining = n_elements - e_base;
+    const size_t n = remaining < BATCH ? remaining : BATCH;
+
+    /* Phase A: AoS -> SoA transpose. */
+    for (size_t i = 0; i < n; ++i) {
+      const t8_dtri_t *el = elements[e_base + i];
+      T8_ASSERT (el != NULL);
+      T8_ASSERT (0 <= el->level && el->level <= T8_DTRI_MAXLEVEL);
+      xs[i] = el->x;
+      ys[i] = el->y;
+#ifdef T8_DTRI_TO_DTET
+      zs[i] = el->z;
+#endif
+      my_levels[i] = el->level;
+      types_init[i] = el->type;
+    }
+
+    /* Phase B: per-element init + compute_type. Loop count is per-element so
+     * this phase is NOT SIMD-vectorized; it runs in scalar but is cheap
+     * (compute_type is at most level iterations of bit math + LUT lookup). */
+    int max_eff_level = 0;
+    for (size_t i = 0; i < n; ++i) {
+      ids[i] = 0;
+      if (level > my_levels[i]) {
+        /* Mirror scalar's `level > my_level` branch:
+         *   exponent = (level - my_level) * T8_DTRI_DIM;
+         *   type_temp = element->type;
+         *   level = my_level;  (local-to-scalar mutation; mirrored by eff_level)
+         */
+        exponents[i] = (level - my_levels[i]) * T8_DTRI_DIM;
+        types_cur[i] = types_init[i];
+        eff_levels[i] = my_levels[i];
+      }
+      else {
+        /* Mirror scalar's `compute_type(element, level)` branch (which dispatches
+         * to compute_type_ext). compute_type_ext has TWO short-circuit cases
+         * before the walk:
+         *   1. level == known_level  -> return known_type
+         *   2. level == 0            -> return 0  (root type is hardcoded)
+         * We replicate both. Case 1 is naturally handled by the for-loop's bound
+         * (lv = my_level, lv > level fails immediately when level == my_level).
+         * Case 2 is NOT handled by the for-loop alone — without this early-set,
+         * we'd walk the LUT chain even though the result will be discarded
+         * (eff_level becomes 0 so Phase C masks the lane off). For OUTPUT
+         * bit-equality the discrepancy is harmless, but matching scalar's
+         * internal state defensively protects against any future code that
+         * reads types_cur[i] after this phase.
+         */
+        exponents[i] = 0;
+        int8_t t;
+        if (level == 0) {
+          t = 0;
+        }
+        else {
+          t = types_init[i];
+          for (int lv = my_levels[i]; lv > level; --lv) {
+            const t8_dtri_coord_t h = T8_DTRI_LEN (lv);
+            int cid = (xs[i] & h) ? 0x01 : 0;
+            if (ys[i] & h) cid |= 0x02;
+#ifdef T8_DTRI_TO_DTET
+            if (zs[i] & h) cid |= 0x04;
+#endif
+            t = t8_dtri_cid_type_to_parenttype[cid][t];
+          }
+        }
+        types_cur[i] = t;
+        eff_levels[i] = level;
+      }
+      if (eff_levels[i] > max_eff_level) {
+        max_eff_level = eff_levels[i];
+      }
+    }
+
+    /* Phase C: main accumulation. Outer loop over levels (uniform across lanes
+     * within the chunk); inner loop over elements (SIMD axis). Lanes whose
+     * eff_level < current outer lv are masked off via the predicate. This is
+     * the bit-for-bit analogue of scalar's
+     *     for (i = eff_level; i > 0; i--) { ... }
+     * just reordered so all lanes step through their levels synchronously. */
+    for (int lv = max_eff_level; lv > 0; --lv) {
+      const t8_dtri_coord_t h = T8_DTRI_LEN (lv);
+#pragma omp simd
+      for (size_t i = 0; i < n; ++i) {
+        /* Predicated: lanes with eff_level < lv have already "passed" their
+         * effective level in scalar's order (lv = eff_level, eff_level-1, ...).
+         * Skip them; their state is preserved unchanged. */
+        if (lv <= eff_levels[i]) {
+          int cid = (xs[i] & h) ? 0x01 : 0;
+          if (ys[i] & h) cid |= 0x02;
+#ifdef T8_DTRI_TO_DTET
+          if (zs[i] & h) cid |= 0x04;
+#endif
+          ids[i] |= ((t8_linearidx_t) t8_dtri_type_cid_to_Iloc[types_cur[i]][cid]) << exponents[i];
+          exponents[i] += T8_DTRI_DIM;
+          types_cur[i] = t8_dtri_cid_type_to_parenttype[cid][types_cur[i]];
+        }
+      }
+    }
+
+    /* Phase D: write back. */
+    for (size_t i = 0; i < n; ++i) {
+      ids_out[e_base + i] = ids[i];
+    }
+  }
+}
+
 void
 t8_dtri_init_linear_id_with_level (t8_dtri_t *element, t8_linearidx_t id, const int start_level, const int end_level,
                                    t8_dtri_type_t parenttype)

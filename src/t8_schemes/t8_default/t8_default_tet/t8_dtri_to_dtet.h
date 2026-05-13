@@ -98,6 +98,7 @@ T8_EXTERN_C_BEGIN ();
 #define t8_dtri_is_parent t8_dtet_is_parent                                 /**< Wrapper of tri function to tet.*/
 #define t8_dtri_is_ancestor t8_dtet_is_ancestor                             /**< Wrapper of tri function to tet.*/
 #define t8_dtri_linear_id t8_dtet_linear_id                                 /**< Wrapper of tri function to tet.*/
+#define t8_dtri_linear_id_batch t8_dtet_linear_id_batch                     /**< Wrapper of tri function to tet.*/
 #define t8_dtri_linear_id_corner_desc t8_dtet_linear_id_corner_desc         /**< Wrapper of tri function to tet.*/
 #define t8_dtri_init_linear_id t8_dtet_init_linear_id                       /**< Wrapper of tri function to tet.*/
 #define t8_dtri_init_root t8_dtet_init_root                                 /**< Wrapper of tri function to tet.*/
