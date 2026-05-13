@@ -74,6 +74,35 @@ t8_locidx_t
 t8_forest_bin_search_lower (const t8_element_array_t *elements, const t8_linearidx_t element_id,
                             const int element_level)
 {
+  /* Cache-aware fast path. If the element_array carries a populated
+   * linear_id cache that was filled at the same level we are now querying
+   * (the freshness predicates inside t8_element_array_get_linear_id_cache
+   * also require the cache count to match the current element count), we
+   * can run the binary search directly over the precomputed t8_linearidx_t
+   * values and skip the per-comparator scheme->element_get_linear_id call.
+   *
+   * If the cache is missing, stale, or filled at a different level, the
+   * helper returns NULL and we fall through to the scalar path below,
+   * preserving exact pre-cache semantics. */
+  const t8_linearidx_t *cache = t8_element_array_get_linear_id_cache (elements, element_level);
+  if (cache != NULL) {
+    /* The freshness predicate guarantees linear_id_cache_count ==
+     * array.elem_count; both are > 0 because we never populate an empty
+     * array's cache (populator skips count==0 by construction). */
+    const size_t count = t8_element_array_get_count (elements);
+    T8_ASSERT (count > 0);
+    /* Mirror the scalar early-return: if the first element already has a
+     * larger linear_id than the query, no element is smaller. */
+    if (cache[0] > element_id) {
+      return -1;
+    }
+    /* std::upper_bound over the cache returns a pointer to the first entry
+     * strictly greater than element_id (or cache + count if none). The
+     * largest entry <= element_id therefore sits at (upper - cache) - 1. */
+    const t8_linearidx_t *upper = std::upper_bound (cache, cache + count, element_id);
+    return static_cast<t8_locidx_t> ((upper - cache) - 1);
+  }
+
   const t8_scheme *scheme = t8_element_array_get_scheme (elements);
   const t8_eclass_t tree_class = t8_element_array_get_tree_class (elements);
   /* At first, we check whether any element has smaller id than the
