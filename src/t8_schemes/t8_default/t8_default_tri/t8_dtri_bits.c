@@ -1529,12 +1529,40 @@ t8_dtri_linear_id (const t8_dtri_t *element, int level)
  *     dispatched the same way as scalar.
  */
 #ifndef T8_DTRI_LINEAR_ID_BATCH_SIZE
-/* Chunk size for the SoA scratch. Sized so the working set (~10 × BATCH bytes
- * of int32 / int8 / int / linearidx_t arrays = ~2 KB at BATCH=64) fits
- * comfortably in L1d on any modern x86. Larger chunks amortize the SoA transpose
- * better but waste L1; smaller chunks reduce vectorization benefit. 64 is a
- * conservative sweet spot. */
+/* Chunk size for the SoA scratch. Sized so the working set (~50 × BATCH bytes
+ * of int64 / int8 / linearidx_t arrays ≈ 3.2 KB at BATCH=64) fits comfortably
+ * in L1d on any modern x86. Larger chunks amortize the SoA transpose better
+ * but waste L1; smaller chunks reduce vectorization benefit. 64 is a
+ * conservative sweet spot AND is a multiple of every common SIMD width
+ * (AVX2 4-wide-i64; AVX-512 8-wide-i64; ARM NEON 2-wide-i64). */
 #define T8_DTRI_LINEAR_ID_BATCH_SIZE 64
+#endif
+
+/* The Phase C inner loop has an AVX2 SIMD specialization for 2D. Selection is
+ * compile-time:
+ *   - 2D context on x86_64/i386 GCC                → SIMD path (4-wide i64 lanes).
+ *   - Otherwise (incl. T8_DTRI_TO_DTET = 3D, ARM,
+ *     non-GCC compilers)                           → scalar path with
+ *                                                     #pragma omp simd hint.
+ *
+ * Both paths are functionally equivalent and the standalone
+ * `test_batch_linear_id` regression checks bit-equality against the scalar
+ * t8_dtri_linear_id for both.
+ *
+ * The `#pragma GCC target("avx2")` block enables AVX2 codegen for ONLY the
+ * batched function — the rest of t8_dtri_bits.c stays at whatever the
+ * project-level baseline is. Practically every x86_64 CPU made since 2013
+ * (Intel Haswell / AMD Excavator) has AVX2; if the binary is ever run on an
+ * older CPU it will SIGILL on first execution of this function. A future
+ * commit could add __builtin_cpu_supports("avx2") runtime detection +
+ * dispatch if portability to pre-2013 hardware is required. */
+#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__)) && !defined(T8_DTRI_TO_DTET)
+#define T8_DTRI_LINEAR_ID_BATCH_HAVE_AVX2 1
+#pragma GCC push_options
+#pragma GCC target("avx2")
+#include <immintrin.h>
+#else
+#define T8_DTRI_LINEAR_ID_BATCH_HAVE_AVX2 0
 #endif
 
 void
@@ -1549,22 +1577,57 @@ t8_dtri_linear_id_batch (const t8_dtri_t **elements, size_t n_elements, int leve
   }
 
   /* Stack scratch sized to T8_DTRI_LINEAR_ID_BATCH_SIZE. The chunked loop below
-   * processes the input in slices of up to BATCH elements at a time. */
+   * processes the input in slices of up to BATCH elements at a time.
+   *
+   * Storage widths chosen so that AVX2 4-wide loads/stores work with no
+   * inline narrow/widen casts:
+   *   - xs, ys (and zs in 3D): int64_t  (was int32; widened so SIMD can load
+   *     as __m256i directly).
+   *   - my_levels, types_init: int8_t   (only read in scalar Phase A/B; no SIMD).
+   *   - types_cur, eff_levels, exponents: int64_t (read+written by SIMD Phase C).
+   *   - ids: t8_linearidx_t (uint64_t, already 64-bit).
+   *
+   * In 2D the per-chunk working set is ~ 64 × (8+8+1+1+8+8+8+8) ≈ 3.2 KB.
+   * In 3D (T8_DTRI_TO_DTET) we additionally allocate zs[BATCH] which adds
+   * 64 × 8 = 512 bytes — still well within L1d. */
   const size_t BATCH = T8_DTRI_LINEAR_ID_BATCH_SIZE;
 
-  t8_dtri_coord_t xs[T8_DTRI_LINEAR_ID_BATCH_SIZE];
-  t8_dtri_coord_t ys[T8_DTRI_LINEAR_ID_BATCH_SIZE];
+  int64_t xs[T8_DTRI_LINEAR_ID_BATCH_SIZE];
+  int64_t ys[T8_DTRI_LINEAR_ID_BATCH_SIZE];
 #ifdef T8_DTRI_TO_DTET
-  t8_dtri_coord_t zs[T8_DTRI_LINEAR_ID_BATCH_SIZE];
+  int64_t zs[T8_DTRI_LINEAR_ID_BATCH_SIZE];
 #endif
-  /* my_level, types_init are stored 8-bit-narrow; types_cur is 8-bit because the
-   * parenttype LUT returns int8_t and 2D triangle types are {0, 1}. */
-  int8_t my_levels[T8_DTRI_LINEAR_ID_BATCH_SIZE];
-  int8_t types_init[T8_DTRI_LINEAR_ID_BATCH_SIZE];
-  int8_t types_cur[T8_DTRI_LINEAR_ID_BATCH_SIZE];
-  int eff_levels[T8_DTRI_LINEAR_ID_BATCH_SIZE];
-  int exponents[T8_DTRI_LINEAR_ID_BATCH_SIZE];
+  int8_t  my_levels[T8_DTRI_LINEAR_ID_BATCH_SIZE];
+  int8_t  types_init[T8_DTRI_LINEAR_ID_BATCH_SIZE];
+  int64_t types_cur[T8_DTRI_LINEAR_ID_BATCH_SIZE];
+  int64_t eff_levels[T8_DTRI_LINEAR_ID_BATCH_SIZE];
+  int64_t exponents[T8_DTRI_LINEAR_ID_BATCH_SIZE];
   t8_linearidx_t ids[T8_DTRI_LINEAR_ID_BATCH_SIZE];
+
+#if T8_DTRI_LINEAR_ID_BATCH_HAVE_AVX2
+  /* Pack the LUTs as 16-byte byte-tables. The 2D LUTs are tiny:
+   *   t8_dtri_type_cid_to_Iloc[2][4]  flattened (type*4+cid) =
+   *       [0,1,1,3, 0,2,2,3]      (8 bytes; pad to 16)
+   *   t8_dtri_cid_type_to_parenttype[4][2]  flattened (cid*2+type) =
+   *       [0,1, 0,0, 1,1, 0,1]    (8 bytes; pad to 16)
+   * Replicated to both 128-bit halves of the __m256i because vpshufb operates
+   * per-128-bit lane and we want any of our 4 active lanes (which sit at byte
+   * positions 0, 8, 16, 24 in the index register) to hit the same LUT. */
+  static const int8_t Iloc_lut_bytes[32]
+      = {0, 1, 1, 3, 0, 2, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0,
+         0, 1, 1, 3, 0, 2, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0};
+  static const int8_t pt_lut_bytes[32]
+      = {0, 1, 0, 0, 1, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0,
+         0, 1, 0, 0, 1, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0};
+  const __m256i Iloc_LUT = _mm256_loadu_si256((const __m256i *) Iloc_lut_bytes);
+  const __m256i pt_LUT = _mm256_loadu_si256((const __m256i *) pt_lut_bytes);
+  const __m256i v_one = _mm256_set1_epi64x (1);
+  const __m256i v_two = _mm256_set1_epi64x (2);
+  const __m256i v_zero = _mm256_setzero_si256 ();
+  /* 0xFF mask to keep only the LOW byte of each 64-bit lane after vpshufb
+   * (the other 7 bytes per lane are garbage we don't want polluting the OR). */
+  const __m256i v_lowbyte_mask = _mm256_set1_epi64x (0xFF);
+#endif
 
   for (size_t e_base = 0; e_base < n_elements; e_base += BATCH) {
     const size_t remaining = n_elements - e_base;
@@ -1575,10 +1638,10 @@ t8_dtri_linear_id_batch (const t8_dtri_t **elements, size_t n_elements, int leve
       const t8_dtri_t *el = elements[e_base + i];
       T8_ASSERT (el != NULL);
       T8_ASSERT (0 <= el->level && el->level <= T8_DTRI_MAXLEVEL);
-      xs[i] = el->x;
-      ys[i] = el->y;
+      xs[i] = (int64_t) el->x;
+      ys[i] = (int64_t) el->y;
 #ifdef T8_DTRI_TO_DTET
-      zs[i] = el->z;
+      zs[i] = (int64_t) el->z;
 #endif
       my_levels[i] = el->level;
       types_init[i] = el->type;
@@ -1596,9 +1659,9 @@ t8_dtri_linear_id_batch (const t8_dtri_t **elements, size_t n_elements, int leve
          *   type_temp = element->type;
          *   level = my_level;  (local-to-scalar mutation; mirrored by eff_level)
          */
-        exponents[i] = (level - my_levels[i]) * T8_DTRI_DIM;
-        types_cur[i] = types_init[i];
-        eff_levels[i] = my_levels[i];
+        exponents[i] = (int64_t) (level - my_levels[i]) * T8_DTRI_DIM;
+        types_cur[i] = (int64_t) types_init[i];
+        eff_levels[i] = (int64_t) my_levels[i];
       }
       else {
         /* Mirror scalar's `compute_type(element, level)` branch (which dispatches
@@ -1632,11 +1695,11 @@ t8_dtri_linear_id_batch (const t8_dtri_t **elements, size_t n_elements, int leve
             t = t8_dtri_cid_type_to_parenttype[cid][t];
           }
         }
-        types_cur[i] = t;
-        eff_levels[i] = level;
+        types_cur[i] = (int64_t) t;
+        eff_levels[i] = (int64_t) level;
       }
       if (eff_levels[i] > max_eff_level) {
-        max_eff_level = eff_levels[i];
+        max_eff_level = (int) eff_levels[i];
       }
     }
 
@@ -1645,14 +1708,96 @@ t8_dtri_linear_id_batch (const t8_dtri_t **elements, size_t n_elements, int leve
      * eff_level < current outer lv are masked off via the predicate. This is
      * the bit-for-bit analogue of scalar's
      *     for (i = eff_level; i > 0; i--) { ... }
-     * just reordered so all lanes step through their levels synchronously. */
+     * just reordered so all lanes step through their levels synchronously.
+     *
+     * AVX2 fast path processes 4 lanes at a time; trailing (n % 4) elements
+     * fall through to the scalar tail loop. Non-AVX2 builds skip the SIMD
+     * path entirely and run only the scalar loop, hinted with #pragma omp simd. */
     for (int lv = max_eff_level; lv > 0; --lv) {
       const t8_dtri_coord_t h = T8_DTRI_LEN (lv);
+
+#if T8_DTRI_LINEAR_ID_BATCH_HAVE_AVX2
+      const __m256i v_h = _mm256_set1_epi64x ((int64_t) h);
+      const __m256i v_lv = _mm256_set1_epi64x ((int64_t) lv);
+
+      size_t i_simd = 0;
+      for (; i_simd + 4 <= n; i_simd += 4) {
+        /* Load lanes' state. xs/ys/types_cur/eff_levels/exponents are int64_t
+         * storage, so a single 256-bit load fetches 4 lanes' worth. */
+        const __m256i xs_v = _mm256_loadu_si256 ((const __m256i *) &xs[i_simd]);
+        const __m256i ys_v = _mm256_loadu_si256 ((const __m256i *) &ys[i_simd]);
+        const __m256i types_v = _mm256_loadu_si256 ((const __m256i *) &types_cur[i_simd]);
+        const __m256i ids_v = _mm256_loadu_si256 ((const __m256i *) &ids[i_simd]);
+        const __m256i exp_v = _mm256_loadu_si256 ((const __m256i *) &exponents[i_simd]);
+        const __m256i el_v = _mm256_loadu_si256 ((const __m256i *) &eff_levels[i_simd]);
+
+        /* cid = ((x & h) ? 1 : 0) | ((y & h) ? 1 : 0) << 1
+         * vpcmpgtq compares signed 64-bit; for our inputs (and h > 0) the
+         * "is nonzero" test is equivalent to ">0". Returns 0 or -1 per lane. */
+        const __m256i x_and = _mm256_and_si256 (xs_v, v_h);
+        const __m256i x_set = _mm256_cmpgt_epi64 (x_and, v_zero);
+        const __m256i x_bit = _mm256_and_si256 (x_set, v_one);
+        const __m256i y_and = _mm256_and_si256 (ys_v, v_h);
+        const __m256i y_set = _mm256_cmpgt_epi64 (y_and, v_zero);
+        const __m256i y_bit = _mm256_and_si256 (y_set, v_two);
+        const __m256i cid_v = _mm256_or_si256 (x_bit, y_bit);
+
+        /* Iloc lookup: flat_idx = types_cur * 4 + cid. Values in [0,7],
+         * sit in the low byte of each 64-bit lane.
+         * vpshufb (per-128-bit-lane) selects byte (idx & 0xF) from the LUT
+         * in each lane independently. Because our flat_idx is in [0,7] and
+         * the LUT is replicated across both 128-bit halves, every active lane
+         * hits the correct byte regardless of which 128-bit half it sits in.
+         *
+         * vpshufb also processes the OTHER bytes of each i64 lane (positions
+         * 1..7, 9..15, 17..23, 25..31 of the 256-bit reg), which contain
+         * "garbage" indices that produce arbitrary outputs at those byte
+         * positions. We mask those off via AND with 0xFF-per-lane below to
+         * isolate the Iloc value in the low byte. */
+        const __m256i iloc_idx = _mm256_add_epi64 (_mm256_slli_epi64 (types_v, 2), cid_v);
+        const __m256i iloc_raw = _mm256_shuffle_epi8 (Iloc_LUT, iloc_idx);
+        const __m256i iloc_v = _mm256_and_si256 (iloc_raw, v_lowbyte_mask);
+
+        /* ids |= (iloc << exponent).  vpsllvq does per-lane variable shift. */
+        const __m256i shifted = _mm256_sllv_epi64 (iloc_v, exp_v);
+        const __m256i ids_new = _mm256_or_si256 (ids_v, shifted);
+        const __m256i exp_new = _mm256_add_epi64 (exp_v, v_two);
+
+        /* parenttype lookup: flat_idx = cid * 2 + types_cur. */
+        const __m256i pt_idx = _mm256_add_epi64 (_mm256_slli_epi64 (cid_v, 1), types_v);
+        const __m256i pt_raw = _mm256_shuffle_epi8 (pt_LUT, pt_idx);
+        const __m256i types_new = _mm256_and_si256 (pt_raw, v_lowbyte_mask);
+
+        /* Active-lane mask: lane is INACTIVE if lv > eff_levels[i].
+         * vpblendvb selects from src1 when high bit of corresponding mask byte
+         * is set, else from src0. We pass (new, old, mask_inactive): inactive
+         * lanes keep old state; active lanes get new. cmpgt returns -1 (high
+         * bit set in every byte) for inactive lanes. */
+        const __m256i mask_inactive = _mm256_cmpgt_epi64 (v_lv, el_v);
+        const __m256i ids_out_v = _mm256_blendv_epi8 (ids_new, ids_v, mask_inactive);
+        const __m256i exp_out_v = _mm256_blendv_epi8 (exp_new, exp_v, mask_inactive);
+        const __m256i types_out_v = _mm256_blendv_epi8 (types_new, types_v, mask_inactive);
+
+        _mm256_storeu_si256 ((__m256i *) &ids[i_simd], ids_out_v);
+        _mm256_storeu_si256 ((__m256i *) &exponents[i_simd], exp_out_v);
+        _mm256_storeu_si256 ((__m256i *) &types_cur[i_simd], types_out_v);
+      }
+
+      /* Scalar tail for remaining (n % 4) elements. */
+      for (size_t i = i_simd; i < n; ++i) {
+        if (lv <= eff_levels[i]) {
+          int cid = (xs[i] & h) ? 0x01 : 0;
+          if (ys[i] & h) cid |= 0x02;
+          ids[i] |= ((t8_linearidx_t) t8_dtri_type_cid_to_Iloc[types_cur[i]][cid]) << exponents[i];
+          exponents[i] += T8_DTRI_DIM;
+          types_cur[i] = (int64_t) t8_dtri_cid_type_to_parenttype[cid][types_cur[i]];
+        }
+      }
+#else
+      /* Non-AVX2 / 3D scalar path. Same body as scalar t8_dtri_linear_id's
+       * for-loop, just executed across the SoA chunk. */
 #pragma omp simd
       for (size_t i = 0; i < n; ++i) {
-        /* Predicated: lanes with eff_level < lv have already "passed" their
-         * effective level in scalar's order (lv = eff_level, eff_level-1, ...).
-         * Skip them; their state is preserved unchanged. */
         if (lv <= eff_levels[i]) {
           int cid = (xs[i] & h) ? 0x01 : 0;
           if (ys[i] & h) cid |= 0x02;
@@ -1661,9 +1806,10 @@ t8_dtri_linear_id_batch (const t8_dtri_t **elements, size_t n_elements, int leve
 #endif
           ids[i] |= ((t8_linearidx_t) t8_dtri_type_cid_to_Iloc[types_cur[i]][cid]) << exponents[i];
           exponents[i] += T8_DTRI_DIM;
-          types_cur[i] = t8_dtri_cid_type_to_parenttype[cid][types_cur[i]];
+          types_cur[i] = (int64_t) t8_dtri_cid_type_to_parenttype[cid][types_cur[i]];
         }
       }
+#endif
     }
 
     /* Phase D: write back. */
@@ -1672,6 +1818,10 @@ t8_dtri_linear_id_batch (const t8_dtri_t **elements, size_t n_elements, int leve
     }
   }
 }
+
+#if T8_DTRI_LINEAR_ID_BATCH_HAVE_AVX2
+#pragma GCC pop_options
+#endif
 
 void
 t8_dtri_init_linear_id_with_level (t8_dtri_t *element, t8_linearidx_t id, const int start_level, const int end_level,
