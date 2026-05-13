@@ -432,6 +432,41 @@ t8_forest_commit (t8_forest_t forest);
 int
 t8_forest_get_maxlevel (const t8_forest_t forest);
 
+/** Populate (or refresh) the per-tree linear_id cache on every local leaf
+ *  element array of the forest at the given uniform-refinement level.
+ *
+ *  This is an optimization hook for callers that perform many
+ *  \ref t8_forest_leaf_face_neighbors lookups (which internally call
+ *  \ref t8_forest_bin_search_lower per neighbor probe). With a populated
+ *  cache the comparator step in bin_search_lower avoids recomputing
+ *  each element's linear_id and instead reads it from the cache.
+ *  Population uses a SIMD-batched code path for triangular and
+ *  tetrahedral element classes; other element classes fall back to a
+ *  per-element scalar loop.
+ *
+ *  Idempotent: trees whose cache is already fresh at \a level are left
+ *  untouched. Population is single-threaded across trees.
+ *
+ *  Thread safety: NOT thread-safe for concurrent calls on the same
+ *  \a forest. The recommended pattern is:
+ *
+ *      // single-threaded prelude
+ *      t8_forest_ensure_linear_id_caches(forest, level);
+ *
+ *      // parallel face-neighbor loop reads the caches
+ *      #pragma omp parallel for ...
+ *
+ *  Caches auto-invalidate when an element array is mutated (resize,
+ *  push, copy, reset, truncate) and on forest destruction. Callers do
+ *  not need to manually free.
+ *
+ *  \param [in,out] forest  Forest whose leaf-array caches should be
+ *                           populated. Must be committed.
+ *  \param [in]     level   Target level. For face-neighbor lookups this
+ *                           should equal \ref t8_forest_get_maxlevel. */
+void
+t8_forest_ensure_linear_id_caches (const t8_forest_t forest, int level);
+
 /** Return the number of process local leaf elements in the forest.
  * \param [in]  forest    A forest.
  * \return                The number of leaf elements on this process in \a forest.

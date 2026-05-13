@@ -410,4 +410,26 @@ t8_element_array_get_linear_id_cache (const t8_element_array_t *element_array, i
   return element_array->linear_id_cache;
 }
 
+void
+t8_element_array_set_linear_id_cache (t8_element_array_t *array, t8_linearidx_t *buf, int level, size_t count)
+{
+  T8_ASSERT (array != NULL);
+  T8_ASSERT (t8_element_array_is_valid (array));
+  T8_ASSERT (level >= 0);
+  /* Caller contract: buf == NULL iff count == 0. */
+  T8_ASSERT ((buf == NULL) == (count == 0));
+  /* For the freshness predicate to accept the cache, count must match the
+   * array's current element count. Assert it eagerly here so callers learn
+   * about the mismatch at install time rather than silently failing the
+   * freshness check on the first read. */
+  T8_ASSERT (count == array->array.elem_count);
+  /* Free any previously-installed buffer before overwriting. */
+  if (array->linear_id_cache != NULL) {
+    T8_FREE (array->linear_id_cache);
+  }
+  array->linear_id_cache = buf;
+  array->linear_id_cache_level = level;
+  array->linear_id_cache_count = count;
+}
+
 T8_EXTERN_C_END ();

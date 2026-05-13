@@ -331,6 +331,36 @@ t8_element_array_invalidate_linear_id_cache (t8_element_array_t *element_array);
 const t8_linearidx_t *
 t8_element_array_get_linear_id_cache (const t8_element_array_t *element_array, int level);
 
+/** Install a populated linear_id cache buffer on the array.
+ *
+ * Ownership semantics: \a buf must have been allocated with T8_ALLOC
+ * (or NULL paired with \a count == 0). Ownership transfers to the array
+ * — subsequent invalidation (manual or via a mutator hook) will T8_FREE
+ * the buffer.
+ *
+ * Any previously-installed cache buffer is freed before the new one is
+ * installed.
+ *
+ * The caller is responsible for ensuring \a buf[i] is the
+ * t8_linearidx_t value of element i at \a level for all i in
+ * [0, \a count). The array does not validate the contents.
+ *
+ * Thread safety: NOT thread-safe for concurrent calls on the same
+ * \a array. Callers must serialize cache installation per array
+ * (typical pattern: populate caches in a single-threaded prelude
+ * before entering a parallel read region).
+ *
+ * \param [in,out] array  Array whose cache should be installed.
+ * \param [in]     buf    Heap-allocated cache buffer (or NULL iff
+ *                         \a count == 0). Ownership transfers.
+ * \param [in]     level  Level at which buf[i] holds the linear ID
+ *                         of element i.
+ * \param [in]     count  Number of valid entries; must equal the
+ *                         array's current element count for the
+ *                         cache to satisfy the freshness predicate. */
+void
+t8_element_array_set_linear_id_cache (t8_element_array_t *array, t8_linearidx_t *buf, int level, size_t count);
+
 T8_EXTERN_C_END ();
 
 #endif /* !T8_CONTAINERS_HXX */

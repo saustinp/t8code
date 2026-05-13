@@ -272,6 +272,35 @@ t8_dtet_is_ancestor (const t8_dtet_t *tet, const t8_dtet_t *c);
 t8_linearidx_t
 t8_dtet_linear_id (const t8_dtet_t *tet, int level);
 
+/** Batched form of \ref t8_dtet_linear_id.
+ *
+ *  Computes the linear ID of every tetrahedron in a contiguous batch in
+ *  one call. Internally a one-time setup amortizes the level walk and the
+ *  per-call dispatch overhead across the whole batch, and the inner loop
+ *  is SIMD-friendly (compiled with `#pragma GCC target("avx2")` on x86,
+ *  scalar elsewhere) so the per-element cost approaches that of a few
+ *  byte-shuffles plus a shift.
+ *
+ *  The function is useful when the caller needs the linear IDs of many
+ *  elements (e.g. precomputing a comparator cache for a binary search),
+ *  amortizing both compute_type setup and per-call overhead across the
+ *  batch.
+ *
+ *  \param [in]  elements    Array of \a n_elements pointers to tetrahedra.
+ *                            Each pointer must be non-null and refer to a
+ *                            tetrahedron with 0 <= level <= T8_DTET_MAXLEVEL.
+ *                            The pointed-to tetrahedra need not be contiguous
+ *                            in memory.
+ *  \param [in]  n_elements  Number of tetrahedra to process. May be zero.
+ *  \param [in]  level       Target level for the linear ID. Must satisfy
+ *                            0 <= level <= T8_DTET_MAXLEVEL.
+ *  \param [out] ids_out     Array of length \a n_elements. On return,
+ *                            ids_out[i] holds the linear ID of
+ *                            elements[i] at \a level.
+ */
+void
+t8_dtet_linear_id_batch (const t8_dtet_t **elements, size_t n_elements, int level, t8_linearidx_t *ids_out);
+
 /**
  * Same as init_linear_id, but we only consider the subtree. Used for computing the index of a
  * tetrahedron lying in a pyramid

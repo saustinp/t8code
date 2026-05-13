@@ -213,6 +213,45 @@ t8_locidx_t
 t8_forest_bin_search_lower (const t8_element_array_t *elements, const t8_linearidx_t element_id,
                             const int element_level);
 
+/** \brief Populate (or refresh) the linear_id cache on a leaf element array
+ *  for the given uniform-refinement level.
+ *
+ *  Designed to accelerate the hot face-neighbor lookup path, where each
+ *  call to \ref t8_forest_bin_search_lower would otherwise recompute the
+ *  comparand's linear ID via an O(log N) level walk + LUT chain per
+ *  comparator step. With a populated cache,
+ *  \ref t8_forest_bin_search_lower runs std::upper_bound directly over the
+ *  precomputed values.
+ *
+ *  Semantics:
+ *    - If the cache is already populated at \a level (freshness check via
+ *      \ref t8_element_array_get_linear_id_cache), this is a no-op.
+ *    - Otherwise any stale cache is discarded, a fresh buffer is
+ *      allocated, and filled via the scheme's batched linear_id function
+ *      (\ref t8_dtri_linear_id_batch for T8_ECLASS_TRIANGLE,
+ *       \ref t8_dtet_linear_id_batch for T8_ECLASS_TET; per-element
+ *       scalar fallback otherwise).
+ *    - An empty array leaves the cache unpopulated.
+ *
+ *  Thread safety: NOT thread-safe for concurrent calls on the same
+ *  \a elements array. The intended usage pattern is:
+ *
+ *      // single-threaded prelude
+ *      for each leaf array A:
+ *          t8_forest_element_array_ensure_linear_id_cache(A, level);
+ *
+ *      // parallel region
+ *      #pragma omp parallel for ...
+ *      for each element e:
+ *          ... t8_forest_bin_search_lower(...) ...   // reads cache
+ *
+ *  Populating different arrays from different threads is safe.
+ *
+ *  \param [in,out] elements  Element array to populate.
+ *  \param [in]     level     Target level. */
+void
+t8_forest_element_array_ensure_linear_id_cache (t8_element_array_t *elements, int level);
+
 /** \brief Search for a linear element id (at level element_level) in a sorted array of
  * elements. If the element does not exist, return the smallest index i
  * such that the element at position i has a larger or equal id than the given one.

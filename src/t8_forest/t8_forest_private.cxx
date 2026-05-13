@@ -25,6 +25,8 @@
 #include <t8_forest/t8_forest_private.h>
 #include <t8_forest/t8_forest_general.h>
 #include <t8_data/t8_element_array_iterator.hxx>
+#include <t8_schemes/t8_default/t8_default_tri/t8_dtri_bits.h>
+#include <t8_schemes/t8_default/t8_default_tet/t8_dtet_bits.h>
 
 T8_EXTERN_C_BEGIN ();
 
@@ -247,6 +249,80 @@ t8_forest_bin_search_first_descendant_ancestor (const t8_element_array_t *elemen
   // No ancestor or descendant was found
   *element_found = nullptr;
   return -1;
+}
+
+void
+t8_forest_element_array_ensure_linear_id_cache (t8_element_array_t *elements, int level)
+{
+  T8_ASSERT (elements != NULL);
+  T8_ASSERT (t8_element_array_is_valid (elements));
+  T8_ASSERT (level >= 0);
+
+  /* Idempotency: already fresh at this level → no work. */
+  if (t8_element_array_get_linear_id_cache (elements, level) != NULL) {
+    return;
+  }
+
+  /* Drop any stale cache (different level or count, or a partial state). */
+  t8_element_array_invalidate_linear_id_cache (elements);
+
+  const size_t count = t8_element_array_get_count (elements);
+  if (count == 0) {
+    /* Empty array: leave the cache unpopulated. No real caller hits the
+     * hot path on an empty array, but if one does, bin_search_lower will
+     * fall through to its scalar path (which itself does not guard
+     * count==0 — that is a pre-existing characteristic of the API). */
+    return;
+  }
+
+  t8_linearidx_t *cache = T8_ALLOC (t8_linearidx_t, count);
+
+  const t8_eclass_t tree_class = t8_element_array_get_tree_class (elements);
+
+  if (tree_class == T8_ECLASS_TRIANGLE) {
+    /* SIMD-accelerated path. Build the pointer array required by the
+     * batched API; the pointer array itself is small (sizeof(void*) per
+     * element) and stack-temporary lifetime, so heap allocation is fine. */
+    const t8_dtri_t **el_ptrs = T8_ALLOC (const t8_dtri_t *, count);
+    for (size_t i = 0; i < count; ++i) {
+      el_ptrs[i] = (const t8_dtri_t *) t8_element_array_index_int (elements, (int) i);
+    }
+    t8_dtri_linear_id_batch (el_ptrs, count, level, cache);
+    T8_FREE (el_ptrs);
+  }
+  else if (tree_class == T8_ECLASS_TET) {
+    /* Same pattern as TRIANGLE but routed to the tet batched function. */
+    const t8_dtet_t **el_ptrs = T8_ALLOC (const t8_dtet_t *, count);
+    for (size_t i = 0; i < count; ++i) {
+      el_ptrs[i] = (const t8_dtet_t *) t8_element_array_index_int (elements, (int) i);
+    }
+    t8_dtet_linear_id_batch (el_ptrs, count, level, cache);
+    T8_FREE (el_ptrs);
+  }
+  else {
+    /* Generic scalar fallback (no SIMD specialization for this scheme). */
+    const t8_scheme *scheme = t8_element_array_get_scheme (elements);
+    for (size_t i = 0; i < count; ++i) {
+      const t8_element_t *elem = t8_element_array_index_int (elements, (int) i);
+      cache[i] = scheme->element_get_linear_id (tree_class, elem, level);
+    }
+  }
+
+  /* Hand ownership of the buffer to the array. */
+  t8_element_array_set_linear_id_cache (elements, cache, level, count);
+}
+
+void
+t8_forest_ensure_linear_id_caches (const t8_forest_t forest, int level)
+{
+  T8_ASSERT (forest != NULL);
+  T8_ASSERT (t8_forest_is_committed (forest));
+  T8_ASSERT (level >= 0);
+  const t8_locidx_t num_local_trees = t8_forest_get_num_local_trees (forest);
+  for (t8_locidx_t ltreeid = 0; ltreeid < num_local_trees; ++ltreeid) {
+    t8_element_array_t *leaves = t8_forest_get_tree_leaf_element_array_mutable (forest, ltreeid);
+    t8_forest_element_array_ensure_linear_id_cache (leaves, level);
+  }
 }
 
 T8_EXTERN_C_END ();
