@@ -144,6 +144,7 @@ add_t8_cpp_test( NAME t8_gtest_shmem_parallel  SOURCES t8_data/t8_gtest_shmem.cx
 add_t8_cpp_test( NAME t8_gtest_data_pack_parallel       SOURCES t8_data/t8_gtest_data_handler.cxx t8_data/t8_data_handler_specs.cxx)
 
 add_t8_cpp_test( NAME t8_gtest_bin_search_parallel                SOURCES t8_forest/t8_gtest_bin_search.cxx t8_gtest_adapt_callbacks.cxx )
+add_t8_cpp_test( NAME t8_gtest_bin_search_cache_parallel          SOURCES t8_forest/t8_gtest_bin_search_cache.cxx t8_gtest_adapt_callbacks.cxx )
 add_t8_cpp_test( NAME t8_gtest_element_volume_serial              SOURCES t8_forest/t8_gtest_element_volume.cxx )
 add_t8_cpp_test( NAME t8_gtest_search_parallel                    SOURCES t8_forest/t8_gtest_search.cxx )
 add_t8_cpp_test( NAME t8_gtest_half_neighbors_parallel            SOURCES t8_forest/t8_gtest_half_neighbors.cxx )
