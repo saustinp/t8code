@@ -94,16 +94,21 @@ t8_cmesh_check_trees_per_eclass (t8_cmesh_t cmesh)
 int
 t8_cmesh_is_committed (const t8_cmesh_t cmesh)
 {
-  static int is_checking = 0;
-
-  /* We run into a stackoverflow if routines that we call here,
-   * also call t8_cmesh_is_committed.
-   * We prevent this with the static variable is_checking.
-   * This variable lives beyond one execution of t8_cmesh_is_committed.
-   * We use it as a form of lock to prevent entering an infinite recursion.
+  /* Per-thread recursion guard. Was `static int is_checking` historically,
+   * but that races under OpenMP: TSan flags 70+ instances of this race on
+   * the amr_dev test suite (commit gfe65508b6 era). The recursion guard is
+   * semantically per-call-stack, so per-thread storage is the correct
+   * scope — each thread has its own recursion path through the cmesh
+   * validation code, and one thread's "currently checking" state must
+   * not block another thread's check.
+   *
+   * The function returns 1 on success regardless of interleaving; the
+   * guard merely prevents infinite recursion within a single call chain.
+   * Per-thread storage preserves that invariant while eliminating the
+   * write-write and write-read races on the global flag.
    */
-  /* TODO: This is_checking is not thread safe. If two threads call cmesh routines
-   *       that call t8_cmesh_is_committed, only one of them will correctly check the cmesh. */
+  static thread_local int is_checking = 0;
+
   if (!is_checking) {
     is_checking = 1;
 
