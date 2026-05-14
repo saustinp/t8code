@@ -1885,6 +1885,154 @@ t8_forest_leaf_face_neighbors (t8_forest_t forest, t8_locidx_t ltreeid, const t8
                                      pelement_indices, pneigh_eclass, forest_is_balanced, NULL, NULL);
 }
 
+int
+t8_forest_leaf_face_neighbors_count (t8_forest_t forest, t8_locidx_t ltreeid, const t8_element_t *leaf, int face)
+{
+  /* This routine is a count-only specialization of t8_forest_leaf_face_neighbors_ext.
+   * It mirrors the balanced-forest branch of that function but skips every
+   * caller-facing per-call allocation (pneighbor_leaves, pelement_indices,
+   * dual_faces) and replaces the per-half-neighbor bin_search loop with a
+   * single bin_search on the FIRST half-face neighbor — sufficient to
+   * disambiguate "1 coarse ancestor" from "N hanging children-faces"
+   * because in a balanced forest those are the only two possible cases
+   * once the boundary case has been ruled out. */
+
+  T8_ASSERT (t8_forest_is_committed (forest));
+  T8_ASSERT (t8_forest_element_is_leaf (forest, leaf, ltreeid));
+  SC_CHECK_ABORT (forest->mpisize == 1 || forest->ghosts != NULL,
+                  "Ghost structure is needed for t8_forest_leaf_face_neighbors_count "
+                  "but was not found in forest.\n");
+
+  const t8_scheme *scheme = t8_forest_get_scheme (forest);
+  const t8_eclass_t eclass = t8_forest_get_tree_class (forest, ltreeid);
+  const t8_eclass_t neigh_eclass = t8_forest_element_neighbor_eclass (forest, ltreeid, leaf, face);
+  const int at_maxlevel = scheme->element_get_level (eclass, leaf) == t8_forest_get_maxlevel (forest);
+
+  /* Number of children-of-the-other-side-face that would be touched. At
+   * the maximum refinement level there is a single same-level neighbor;
+   * otherwise there are scheme->element_get_num_face_children of them. */
+  const int num_children_at_face = at_maxlevel ? 1 : scheme->element_get_num_face_children (eclass, leaf, face);
+
+  /* Heap-allocate the scratch element pointer array + dual_faces buffer.
+   * num_children_at_face is at most 4 in 3D quad-faces; the storage is
+   * tiny. We need ALL N half-face neighbors in the MPI > 1 case to
+   * detect different-owner configurations; for the single-owner case
+   * only the first is actually consulted, but allocating all of them
+   * keeps the t8_forest_element_half_face_neighbors interface contract
+   * intact. */
+  t8_element_t **half_neighbors = T8_ALLOC (t8_element_t *, num_children_at_face);
+  scheme->element_new (neigh_eclass, num_children_at_face, half_neighbors);
+  int dual_faces_scratch[T8_ECLASS_MAX_FACES];
+  T8_ASSERT (num_children_at_face <= T8_ECLASS_MAX_FACES);
+
+  t8_gloidx_t gneigh_treeid;
+  if (at_maxlevel) {
+    /* Single same-level neighbor: scheme provides the direct face neighbor. */
+    gneigh_treeid = t8_forest_element_face_neighbor (forest, ltreeid, leaf, half_neighbors[0], neigh_eclass, face,
+                                                     dual_faces_scratch);
+  }
+  else {
+    /* Coarser-or-equal-level neighbor decomposed into half-face neighbors;
+     * scheme returns the N children-faces' neighbor elements. */
+    gneigh_treeid = t8_forest_element_half_face_neighbors (forest, ltreeid, leaf, half_neighbors, neigh_eclass, face,
+                                                           num_children_at_face, dual_faces_scratch);
+  }
+
+  int result;
+  t8_locidx_t lneigh_treeid = -1;
+  t8_locidx_t lghost_treeid = -1;
+
+  if (gneigh_treeid < 0) {
+    /* Boundary face — no neighbor on the other side. */
+    result = 0;
+  }
+  else {
+    /* Owner-determination loop. In a single-MPI-rank forest we always
+     * own everything, so this loop is trivially first_owner = mpirank
+     * for every half-neighbor (different_owners stays 0). In multi-rank
+     * forests we need the loop to detect the "different owners imply
+     * the half-neighbors are themselves leaves" case (see the full
+     * function's handling around the !different_owners check). */
+    int different_owners = 0;
+    int have_ghosts = 0;
+    int first_owner = -1;
+
+    for (int ineigh = 0; ineigh < num_children_at_face; ++ineigh) {
+      int owner;
+      if (t8_forest_element_check_owner (forest, half_neighbors[ineigh], gneigh_treeid, neigh_eclass, forest->mpirank,
+                                         at_maxlevel)) {
+        owner = forest->mpirank;
+        lneigh_treeid = t8_forest_get_local_id (forest, gneigh_treeid);
+      }
+      else {
+        owner = t8_forest_element_find_owner (forest, gneigh_treeid, half_neighbors[ineigh], neigh_eclass);
+        have_ghosts = 1;
+      }
+      if (ineigh == 0) {
+        first_owner = owner;
+      }
+      else if (owner != first_owner) {
+        different_owners = 1;
+        break;
+      }
+    }
+
+    if (different_owners) {
+      /* Different owners can only happen if each half-face neighbor is
+       * itself a leaf on its respective owner's process — i.e., a true
+       * hanging configuration with N distinct neighbor leaves. */
+      result = num_children_at_face;
+    }
+    else {
+      /* Single owner. Resolve the ghost tree id if needed. */
+      if (have_ghosts) {
+        lghost_treeid = t8_forest_ghost_get_ghost_treeid (forest, gneigh_treeid);
+        T8_ASSERT (lghost_treeid >= 0);
+      }
+
+      /* Find the leaf ANCESTOR of the first half-face neighbor via the
+       * standard bin_search_lower probe; this is either the half-face
+       * neighbor itself (so all half-neighbors are leaves → hanging) or
+       * a coarser parent/grandparent that IS a leaf (so there is a
+       * single coarse neighbor on the other side). */
+      const t8_linearidx_t neigh_id
+        = scheme->element_get_linear_id (neigh_eclass, half_neighbors[0], forest->maxlevel);
+      t8_locidx_t element_index;
+      const t8_element_t *ancestor;
+
+      if (first_owner != forest->mpirank) {
+        const t8_element_array_t *element_array = t8_forest_ghost_get_tree_leaf_elements (forest, lghost_treeid);
+        element_index = t8_forest_bin_search_lower (element_array, neigh_id, forest->maxlevel);
+        T8_ASSERT (element_index >= 0);
+        ancestor = t8_forest_ghost_get_leaf_element (forest, lghost_treeid, element_index);
+      }
+      else {
+        const t8_element_array_t *element_array = t8_forest_get_tree_leaf_element_array (forest, lneigh_treeid);
+        element_index = t8_forest_bin_search_lower (element_array, neigh_id, forest->maxlevel);
+        T8_ASSERT (element_index >= 0);
+        ancestor = t8_forest_get_tree_leaf_element (t8_forest_get_tree (forest, lneigh_treeid), element_index);
+      }
+
+      /* element_compare returns < 0 iff ancestor has a lower level (i.e.,
+       * the actual leaf is the parent or grandparent of the half-face
+       * neighbor) — exactly the "1 coarse neighbor" case. Otherwise the
+       * half-face neighbors are themselves leaves — the hanging case. */
+      if (scheme->element_compare (neigh_eclass, ancestor, half_neighbors[0]) < 0) {
+        result = 1;
+      }
+      else {
+        result = num_children_at_face;
+      }
+    }
+  }
+
+  /* Cleanup scratch elements (single batch destroy + free). */
+  scheme->element_destroy (neigh_eclass, num_children_at_face, half_neighbors);
+  T8_FREE (half_neighbors);
+
+  return result;
+}
+
 void
 t8_forest_print_all_leaf_neighbors (t8_forest_t forest)
 {

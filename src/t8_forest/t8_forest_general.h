@@ -637,6 +637,59 @@ t8_forest_leaf_face_neighbors (t8_forest_t forest, t8_locidx_t ltreeid, const t8
                                t8_element_t **pneighbor_leaves[], int face, int *dual_faces[], int *num_neighbors,
                                t8_locidx_t **pelement_indices, t8_eclass_t *pneigh_eclass, int forest_is_balanced);
 
+/** Count-only variant of \ref t8_forest_leaf_face_neighbors.
+ *
+ *  Returns just the number of face neighbors of \a leaf across \a face,
+ *  without allocating per-call output arrays for the neighbor element
+ *  pointers, neighbor element indices, or dual-face indices that the
+ *  caller of the full version would have to manage and free.
+ *
+ *  Use this when the caller's only need is the COUNT — for example, in
+ *  hanging-node detection where the only decision is "count > 1 implies
+ *  a hanging configuration." Callers that actually need the neighbor
+ *  leaves, their local indices, or dual face numbers must continue to
+ *  use \ref t8_forest_leaf_face_neighbors.
+ *
+ *  Return values:
+ *    0  if \a face is a boundary face (no neighbor on the other side).
+ *    1  if there is exactly one face neighbor — either a same-level
+ *       neighbor (regular face) or a coarser-level neighbor on the
+ *       refined side of a hanging configuration.
+ *    N  if the face on the other side is split into N children-faces
+ *       by a refined neighbor cluster (hanging configuration), where
+ *       N == scheme->element_get_num_face_children for this leaf and
+ *       face (typically 2 in 2D, 4 in 3D for quad/hex faces).
+ *
+ *  Cost: one scratch element_new of \a num_children_at_face elements
+ *  (vs the full version's allocation of the same plus an outer pointer
+ *  array, a dual-face array, and a pelement_indices array), and at most
+ *  ONE \ref t8_forest_bin_search_lower call (vs N in the full version's
+ *  per-half-neighbor loop). The bin_search_lower call benefits
+ *  transparently from \ref t8_forest_ensure_linear_id_caches when the
+ *  caller has populated the cache.
+ *
+ *  Preconditions (identical to the full version):
+ *    - \a forest must be committed.
+ *    - \a forest must be balanced.
+ *    - If forest's MPI size > 1, the ghost structure must be present.
+ *    - \a leaf must be a leaf of local tree \a ltreeid.
+ *    - 0 <= \a face < num_faces_of_leaf.
+ *
+ *  Thread safety: safe to call concurrently from multiple threads on
+ *  the same committed forest. Internal allocations route through
+ *  sc_malloc; with SC_NOCOUNT_MALLOC active these are lock-free
+ *  per-thread.
+ *
+ *  \param [in] forest    A committed, balanced forest.
+ *  \param [in] ltreeid   Local tree id of the tree containing \a leaf.
+ *  \param [in] leaf      A leaf of local tree \a ltreeid.
+ *  \param [in] face      The face index on \a leaf to examine.
+ *  \return               Number of leaf face neighbors across \a face,
+ *                        as described above. */
+int
+t8_forest_leaf_face_neighbors_count (t8_forest_t forest, t8_locidx_t ltreeid, const t8_element_t *leaf, int face);
+
+
 /** Like \ref t8_forest_leaf_face_neighbors but also provides information about the global neighbors and the orientation.
  * \param [in]    forest  The forest. Must have a valid ghost layer.
  * \param [in]    ltreeid A local tree id.
