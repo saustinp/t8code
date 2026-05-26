@@ -4,5 +4,5 @@
 	ignore = dirty
 [submodule "sc"]
 	path = sc
-	url = https://github.com/cburstedde/libsc.git
+	url = https://github.com/saustinp/libsc.git
 	ignore = dirty
