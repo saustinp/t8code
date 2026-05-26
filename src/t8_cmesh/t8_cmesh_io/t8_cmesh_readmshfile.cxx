@@ -1969,14 +1969,15 @@ t8_cmesh_msh_file_emit_periodic_joins (t8_cmesh_t cmesh, const t8_msh_tree_verte
         ++emitted;
       }
     }
-    t8_debugf ("[periodic] link %zu (dim=%d, slave_ent=%d, master_ent=%d): emitted %d joins "
-               "(master_face_hash size=%zu).\n",
-               ilink, link.entity_dim, link.slave_entity_tag, link.master_entity_tag, emitted,
-               master_face_hash.size ());
+    t8_global_productionf ("[periodic] link %zu (dim=%d, slave_ent=%d, master_ent=%d): "
+                           "emitted %d joins (master_face_hash size=%zu).\n",
+                           ilink, link.entity_dim, link.slave_entity_tag,
+                           link.master_entity_tag, emitted, master_face_hash.size ());
     total_emitted += emitted;
   }
-  t8_debugf ("[periodic] Total: %d joins emitted across %zu links (%d skipped as lower-codim).\n",
-             total_emitted, links.size (), total_skipped_codim);
+  t8_global_productionf ("[periodic] Total: %d joins emitted across %zu links (%d skipped "
+                         "as lower-codim).\n",
+                         total_emitted, links.size (), total_skipped_codim);
 }
 
 /* Given the number of vertices and for each element a list of its
