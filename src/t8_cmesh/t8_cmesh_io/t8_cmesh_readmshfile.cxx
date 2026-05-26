@@ -35,11 +35,16 @@
 #include <t8_cmesh/t8_cmesh_internal/t8_cmesh_types.h>
 #include <t8_cmesh/t8_cmesh_internal/t8_cmesh_stash.h>
 #include <unordered_set>
+#include <unordered_map>
 #include <optional>
 #include <vector>
 #include <array>
 #include <string>
 #include <map>
+#include <algorithm>
+#include <cstring>
+#include <cstdint>
+#include <utility>
 #if T8_ENABLE_GMSH
 #include <gmsh.h>
 #endif
@@ -1601,6 +1606,406 @@ t8_msh_file_face_orientation (const t8_msh_file_face_t *Face_a, const t8_msh_fil
   return orientation;
 }
 
+/* ====================================================================== *
+ *           Periodic boundary support (gmsh v4 $Periodic block)          *
+ * ====================================================================== *
+ *
+ * gmsh v4 writes a $Periodic block listing which entity pairs are
+ * periodically identified, the affine transform between them, and the
+ * exact slave→master node correspondence (forced congruent by gmsh's
+ * transfinite meshing). t8 has no native concept of "periodic" — but
+ * t8_cmesh_set_join handles periodic wraparound joins identically to
+ * any other tree-tree join. So all we need to do is:
+ *
+ *   1. Parse $Periodic into a list of (slave_entity, master_entity,
+ *      node_correspondence) records (t8_msh_file_4_read_periodic_block).
+ *   2. After find_neighbors (which has marked all open-boundary faces
+ *      as self-joins), scrub the self-joins for periodic-claimed
+ *      (tree, face) pairs (scrub_periodic_self_joins).
+ *   3. For each periodic link of co-dimension 1 (curves in 2D,
+ *      surfaces in 3D), walk slave-side boundary faces, map their
+ *      vertices through the node correspondence, find the matching
+ *      master-side face, compute orientation, and emit a regular
+ *      t8_cmesh_set_join (emit_periodic_joins).
+ *
+ * Lower-dim periodic links (points in 2D, lines in 3D) are
+ * informational only — the implied topology is already captured by
+ * the co-dim-1 links' corner-node correspondences. We log and skip.
+ */
+
+/** One periodic link from gmsh v4's $Periodic block. */
+struct t8_msh_periodic_link_t
+{
+  int entity_dim;                                              /**< 0=point, 1=line, 2=surface (gmsh entity dim) */
+  int slave_entity_tag;                                        /**< gmsh entity tag (slave side) */
+  int master_entity_tag;                                       /**< gmsh entity tag (master side) */
+  std::vector<double> affine;                                  /**< 4x4 row-major matrix; may be empty */
+  std::vector<std::pair<t8_gloidx_t, t8_gloidx_t>> node_pairs; /**< (slave, master) gmsh node IDs */
+};
+
+/** Encode (gloidx tree, int face) as a single 64-bit key for hashing.
+ *  Assumes face < 256, which holds for every t8 eclass today. */
+static inline uint64_t
+t8_msh_pack_tree_face (const t8_gloidx_t tree, const int face)
+{
+  return (static_cast<uint64_t> (tree) << 8) | (static_cast<uint64_t> (face) & 0xFFu);
+}
+
+/** Parse the $Periodic block from a gmsh v4 .msh file. Searches from
+ *  the current file position forward for the $Periodic marker. If no
+ *  $Periodic section is found (EOF reached), returns an empty vector —
+ *  this is NOT an error; .msh files without periodic boundaries simply
+ *  omit the section.
+ *
+ *  Returns std::nullopt on parse error (corrupt block). */
+static std::optional<std::vector<t8_msh_periodic_link_t>>
+t8_cmesh_msh_file_4_read_periodic_block (FILE *fp)
+{
+  std::vector<t8_msh_periodic_link_t> links;
+  char *line = (char *) malloc (1024);
+  char first_word[2048] = "\0";
+  size_t linen = 1024;
+  int retval;
+
+  /* Search forward for $Periodic. */
+  bool found = false;
+  while (!feof (fp)) {
+    retval = t8_cmesh_msh_read_next_line (&line, &linen, fp);
+    if (retval < 0) break;
+    if (sscanf (line, "%2047s", first_word) == 1 && strcmp (first_word, "$Periodic") == 0) {
+      found = true;
+      break;
+    }
+  }
+  if (!found) {
+    free (line);
+    return std::make_optional<std::vector<t8_msh_periodic_link_t>> (links);
+  }
+
+  /* numPeriodicLinks */
+  retval = t8_cmesh_msh_read_next_line (&line, &linen, fp);
+  if (retval < 0) {
+    t8_global_errorf ("Premature EOF reading $Periodic header.\n");
+    free (line);
+    return std::nullopt;
+  }
+  long num_links_long = 0;
+  if (sscanf (line, "%ld", &num_links_long) != 1 || num_links_long < 0) {
+    t8_global_errorf ("Could not parse numPeriodicLinks from: %s", line);
+    free (line);
+    return std::nullopt;
+  }
+  links.reserve (static_cast<size_t> (num_links_long));
+
+  for (long ilink = 0; ilink < num_links_long; ++ilink) {
+    t8_msh_periodic_link_t link;
+
+    /* entityDim entityTagSlave entityTagMaster */
+    retval = t8_cmesh_msh_read_next_line (&line, &linen, fp);
+    if (retval < 0) {
+      t8_global_errorf ("Premature EOF reading link %ld header.\n", ilink);
+      free (line);
+      return std::nullopt;
+    }
+    if (sscanf (line, "%d %d %d", &link.entity_dim, &link.slave_entity_tag, &link.master_entity_tag) != 3) {
+      t8_global_errorf ("Could not parse $Periodic link header (link %ld): %s", ilink, line);
+      free (line);
+      return std::nullopt;
+    }
+
+    /* numAffine value1 value2 ... */
+    retval = t8_cmesh_msh_read_next_line (&line, &linen, fp);
+    if (retval < 0) {
+      t8_global_errorf ("Premature EOF reading affine line for link %ld.\n", ilink);
+      free (line);
+      return std::nullopt;
+    }
+    long num_affine_long = 0;
+    char *p = line;
+    if (sscanf (p, "%ld", &num_affine_long) != 1 || num_affine_long < 0) {
+      t8_global_errorf ("Could not parse numAffine on link %ld from: %s", ilink, line);
+      free (line);
+      return std::nullopt;
+    }
+    /* Step past the count token. */
+    p += strspn (p, " \t\r\n");
+    p += strcspn (p, " \t\r\n");
+    link.affine.resize (static_cast<size_t> (num_affine_long));
+    for (long ia = 0; ia < num_affine_long; ++ia) {
+      double v;
+      int consumed = 0;
+      if (sscanf (p, "%lf%n", &v, &consumed) != 1) {
+        t8_global_errorf ("Could not parse affine entry %ld for link %ld.\n", ia, ilink);
+        free (line);
+        return std::nullopt;
+      }
+      link.affine[static_cast<size_t> (ia)] = v;
+      p += consumed;
+    }
+
+    /* numCorrespondingNodes */
+    retval = t8_cmesh_msh_read_next_line (&line, &linen, fp);
+    if (retval < 0) {
+      t8_global_errorf ("Premature EOF reading numNodes for link %ld.\n", ilink);
+      free (line);
+      return std::nullopt;
+    }
+    long num_nodes_long = 0;
+    if (sscanf (line, "%ld", &num_nodes_long) != 1 || num_nodes_long < 0) {
+      t8_global_errorf ("Could not parse numCorrespondingNodes on link %ld from: %s", ilink, line);
+      free (line);
+      return std::nullopt;
+    }
+    link.node_pairs.reserve (static_cast<size_t> (num_nodes_long));
+
+    for (long in = 0; in < num_nodes_long; ++in) {
+      retval = t8_cmesh_msh_read_next_line (&line, &linen, fp);
+      if (retval < 0) {
+        t8_global_errorf ("Premature EOF reading node pair %ld for link %ld.\n", in, ilink);
+        free (line);
+        return std::nullopt;
+      }
+      long slave_long, master_long;
+      if (sscanf (line, "%ld %ld", &slave_long, &master_long) != 2) {
+        t8_global_errorf ("Could not parse node pair (link %ld, pair %ld): %s", ilink, in, line);
+        free (line);
+        return std::nullopt;
+      }
+      link.node_pairs.emplace_back (static_cast<t8_gloidx_t> (slave_long), static_cast<t8_gloidx_t> (master_long));
+    }
+    links.push_back (std::move (link));
+  }
+
+  free (line);
+  t8_debugf ("[periodic] Parsed %zu periodic links from $Periodic block.\n", links.size ());
+  return std::make_optional<std::vector<t8_msh_periodic_link_t>> (std::move (links));
+}
+
+/** Compute the set of (tree, face) pairs whose face has ALL vertices on
+ *  some periodic entity (slave OR master, across all links). These are
+ *  the faces that find_neighbors will (incorrectly, for our purposes)
+ *  mark as boundary self-joins; we'll scrub those and re-emit as
+ *  proper periodic joins. */
+static std::unordered_set<uint64_t>
+t8_cmesh_msh_file_compute_periodic_face_set (const t8_msh_tree_vertex_indices &vertex_indices,
+                                             const std::vector<t8_msh_periodic_link_t> &links,
+                                             const t8_cmesh_t cmesh)
+{
+  std::unordered_set<uint64_t> periodic_faces;
+  if (links.empty ()) return periodic_faces;
+
+  std::unordered_set<t8_gloidx_t> periodic_nodes;
+  for (const auto &link : links) {
+    for (const auto &pr : link.node_pairs) {
+      periodic_nodes.insert (pr.first);
+      periodic_nodes.insert (pr.second);
+    }
+  }
+  if (periodic_nodes.empty ()) return periodic_faces;
+
+  const t8_gloidx_t num_trees = static_cast<t8_gloidx_t> (cmesh->stash->classes.elem_count);
+  for (t8_gloidx_t gtree = 0; gtree < num_trees; ++gtree) {
+    const auto *class_entry
+      = (t8_stash_class_struct_t *) t8_sc_array_index_locidx (&cmesh->stash->classes, gtree);
+    const t8_eclass_t eclass = class_entry->eclass;
+    const auto &tree_vertices = vertex_indices[gtree];
+    const int nfaces = t8_eclass_num_faces[eclass];
+    for (int iface = 0; iface < nfaces; ++iface) {
+      const t8_eclass_t face_class = (t8_eclass_t) t8_eclass_face_types[eclass][iface];
+      const int nfv = t8_eclass_num_vertices[face_class];
+      bool all_periodic = true;
+      for (int iv = 0; iv < nfv; ++iv) {
+        const t8_gloidx_t v = tree_vertices[t8_face_vertex_to_tree_vertex[eclass][iface][iv]];
+        if (periodic_nodes.find (v) == periodic_nodes.end ()) {
+          all_periodic = false;
+          break;
+        }
+      }
+      if (all_periodic) {
+        periodic_faces.insert (t8_msh_pack_tree_face (gtree, iface));
+      }
+    }
+  }
+  return periodic_faces;
+}
+
+/** Remove from cmesh->stash->joinfaces any boundary self-join (id1==id2
+ *  AND face1==face2) that touches a periodic-claimed face. These were
+ *  emitted by find_neighbors when no interior neighbor was found; we
+ *  replace them below with proper periodic joins. */
+static void
+t8_cmesh_msh_file_scrub_periodic_self_joins (t8_cmesh_t cmesh,
+                                             const std::unordered_set<uint64_t> &periodic_faces)
+{
+  if (periodic_faces.empty ()) return;
+  sc_array_t *joins = &cmesh->stash->joinfaces;
+  const size_t elem_size = joins->elem_size;
+  size_t write = 0;
+  size_t removed = 0;
+  for (size_t read = 0; read < joins->elem_count; ++read) {
+    const t8_stash_joinface_struct_t *j = (t8_stash_joinface_struct_t *) sc_array_index (joins, read);
+    const bool is_self = (j->id1 == j->id2 && j->face1 == j->face2);
+    const uint64_t key1 = t8_msh_pack_tree_face (j->id1, j->face1);
+    const uint64_t key2 = t8_msh_pack_tree_face (j->id2, j->face2);
+    const bool drop = is_self && (periodic_faces.count (key1) > 0 || periodic_faces.count (key2) > 0);
+    if (drop) {
+      ++removed;
+      continue;
+    }
+    if (write != read) {
+      std::memcpy (sc_array_index (joins, write), sc_array_index (joins, read), elem_size);
+    }
+    ++write;
+  }
+  sc_array_resize (joins, write);
+  t8_debugf ("[periodic] Scrubbed %zu boundary self-joins for periodic faces; "
+             "joinfaces array now has %zu entries.\n",
+             removed, write);
+}
+
+/** Emit t8_cmesh_set_join calls for each periodic link of co-dim 1
+ *  (curves in 2D, surfaces in 3D). For each such link:
+ *    1. Build slave_to_master node-correspondence table.
+ *    2. Walk all trees' faces; faces with all vertices in master_set
+ *       are hashed into a canonical-vertex-set lookup table.
+ *    3. Walk all trees' faces again; faces with all vertices in
+ *       slave_set are mapped through slave_to_master, looked up in
+ *       the master hash, and emitted as a t8_cmesh_set_join.
+ *
+ *  Co-dim ≥ 2 links (point pairs in 2D, line pairs in 3D) are
+ *  informational only and are skipped — the co-dim-1 links' node
+ *  correspondences already encode the corner/edge identifications. */
+static void
+t8_cmesh_msh_file_emit_periodic_joins (t8_cmesh_t cmesh, const t8_msh_tree_vertex_indices &vertex_indices,
+                                       const std::vector<t8_msh_periodic_link_t> &links)
+{
+  if (links.empty ()) return;
+  const int cmesh_dim = static_cast<int> (cmesh->dimension);
+
+  auto canonical_key = [](std::vector<t8_gloidx_t> vs) -> std::string {
+    std::sort (vs.begin (), vs.end ());
+    std::string k;
+    k.reserve (vs.size () * 12);
+    for (auto v : vs) {
+      k.append (std::to_string (v));
+      k.append (",");
+    }
+    return k;
+  };
+
+  struct MasterEntry
+  {
+    t8_gloidx_t tree;
+    int face;
+    std::vector<t8_gloidx_t> vertices; /**< in face's local vertex order (NOT sorted) */
+  };
+
+  const t8_gloidx_t num_trees = static_cast<t8_gloidx_t> (cmesh->stash->classes.elem_count);
+
+  int total_emitted = 0;
+  int total_skipped_codim = 0;
+  for (size_t ilink = 0; ilink < links.size (); ++ilink) {
+    const auto &link = links[ilink];
+    if (link.entity_dim != cmesh_dim - 1) {
+      t8_debugf ("[periodic] link %zu: entity_dim=%d, cmesh_dim=%d — skipped (lower-codim).\n",
+                 ilink, link.entity_dim, cmesh_dim);
+      ++total_skipped_codim;
+      continue;
+    }
+
+    std::unordered_map<t8_gloidx_t, t8_gloidx_t> slave_to_master;
+    std::unordered_set<t8_gloidx_t> slave_set, master_set;
+    slave_to_master.reserve (link.node_pairs.size ());
+    for (const auto &pr : link.node_pairs) {
+      slave_to_master[pr.first] = pr.second;
+      slave_set.insert (pr.first);
+      master_set.insert (pr.second);
+    }
+
+    /* Master pass: hash all faces whose vertices are entirely on master entity. */
+    std::unordered_map<std::string, MasterEntry> master_face_hash;
+    for (t8_gloidx_t gtree = 0; gtree < num_trees; ++gtree) {
+      const auto *class_entry
+        = (t8_stash_class_struct_t *) t8_sc_array_index_locidx (&cmesh->stash->classes, gtree);
+      const t8_eclass_t eclass = class_entry->eclass;
+      const auto &tree_vertices = vertex_indices[gtree];
+      const int nfaces = t8_eclass_num_faces[eclass];
+      for (int iface = 0; iface < nfaces; ++iface) {
+        const t8_eclass_t face_class = (t8_eclass_t) t8_eclass_face_types[eclass][iface];
+        const int nfv = t8_eclass_num_vertices[face_class];
+        std::vector<t8_gloidx_t> verts (nfv);
+        bool all_master = true;
+        for (int iv = 0; iv < nfv; ++iv) {
+          verts[iv] = tree_vertices[t8_face_vertex_to_tree_vertex[eclass][iface][iv]];
+          if (master_set.find (verts[iv]) == master_set.end ()) {
+            all_master = false;
+            break;
+          }
+        }
+        if (!all_master) continue;
+        const std::string k = canonical_key (verts);
+        master_face_hash[k] = MasterEntry { gtree, iface, std::move (verts) };
+      }
+    }
+
+    /* Slave pass: for every slave-vertex-only face, look up master and emit join. */
+    int emitted = 0;
+    for (t8_gloidx_t gtree = 0; gtree < num_trees; ++gtree) {
+      const auto *class_entry
+        = (t8_stash_class_struct_t *) t8_sc_array_index_locidx (&cmesh->stash->classes, gtree);
+      const t8_eclass_t eclass = class_entry->eclass;
+      const auto &tree_vertices = vertex_indices[gtree];
+      const int nfaces = t8_eclass_num_faces[eclass];
+      for (int iface = 0; iface < nfaces; ++iface) {
+        const t8_eclass_t face_class = (t8_eclass_t) t8_eclass_face_types[eclass][iface];
+        const int nfv = t8_eclass_num_vertices[face_class];
+        std::vector<t8_gloidx_t> sv (nfv), mv (nfv);
+        bool all_slave = true;
+        for (int iv = 0; iv < nfv; ++iv) {
+          sv[iv] = tree_vertices[t8_face_vertex_to_tree_vertex[eclass][iface][iv]];
+          if (slave_set.find (sv[iv]) == slave_set.end ()) {
+            all_slave = false;
+            break;
+          }
+          mv[iv] = slave_to_master.at (sv[iv]);
+        }
+        if (!all_slave) continue;
+
+        const std::string k = canonical_key (mv);
+        auto it = master_face_hash.find (k);
+        if (it == master_face_hash.end ()) {
+          t8_global_errorf ("[periodic] link %zu: slave face on tree %ld face %d has no matching master "
+                            "face. Periodic correspondence in .msh is inconsistent.\n",
+                            ilink, (long) gtree, iface);
+          continue;
+        }
+        const MasterEntry &m = it->second;
+
+        /* Orientation: index in master_face.vertices of the master node
+         * corresponding to slave_face.vertices[0]. */
+        int orientation = -1;
+        for (size_t mi = 0; mi < m.vertices.size (); ++mi) {
+          if (m.vertices[mi] == mv[0]) {
+            orientation = static_cast<int> (mi);
+            break;
+          }
+        }
+        T8_ASSERT (orientation >= 0);
+        t8_cmesh_set_join (cmesh, gtree, m.tree, iface, m.face, orientation);
+        ++emitted;
+      }
+    }
+    t8_global_productionf ("[periodic] link %zu (dim=%d, slave_ent=%d, master_ent=%d): "
+                           "emitted %d joins (master_face_hash size=%zu).\n",
+                           ilink, link.entity_dim, link.slave_entity_tag,
+                           link.master_entity_tag, emitted, master_face_hash.size ());
+    total_emitted += emitted;
+  }
+  t8_global_productionf ("[periodic] Total: %d joins emitted across %zu links (%d skipped "
+                         "as lower-codim).\n",
+                         total_emitted, links.size (), total_skipped_codim);
+}
+
 /* Given the number of vertices and for each element a list of its
  * vertices, find the neighborship relations of each element */
 /* This routine does only find neighbors between local trees.
@@ -1846,6 +2251,8 @@ t8_cmesh_from_msh_file (const char *fileprefix, const int partition, sc_MPI_Comm
     }
     /* read nodes from the file */
     std::optional<t8_msh_tree_vertex_indices> indices;
+    /* Periodic links parsed from $Periodic block — empty if .msh has none. */
+    std::vector<t8_msh_periodic_link_t> periodic_links;
     switch (msh_version) {
     case 4: {
       auto vertices_opt = t8_msh_file_4_read_nodes (file);
@@ -1861,6 +2268,23 @@ t8_cmesh_from_msh_file (const char *fileprefix, const int partition, sc_MPI_Comm
       }
       indices = t8_cmesh_msh_file_4_read_eles (cmesh, file, *vertices_opt, dim, linear_geometry, use_cad_geometry,
                                                cad_geometry, true);
+      /* Parse $Periodic block (positioned past $Elements, search forward).
+       * Empty vector = no periodic boundaries (NOT an error). nullopt =
+       * corrupt block, treated as fatal. */
+      if (indices) {
+        auto periodic_opt = t8_cmesh_msh_file_4_read_periodic_block (file);
+        if (!periodic_opt) {
+          t8_global_errorf ("Failed to parse $Periodic block in %s\n", current_file);
+          fclose (file);
+          t8_cmesh_destroy (&cmesh);
+          if (partition) {
+            main_proc_read_successful = 0;
+            sc_MPI_Bcast (&main_proc_read_successful, 1, sc_MPI_INT, main_proc, comm);
+          }
+          return NULL;
+        }
+        periodic_links = std::move (*periodic_opt);
+      }
       break;
     }
 
@@ -1878,8 +2302,20 @@ t8_cmesh_from_msh_file (const char *fileprefix, const int partition, sc_MPI_Comm
       }
       return NULL;
     }
-    else
+    else {
       t8_cmesh_msh_file_find_neighbors (cmesh, *indices);
+
+      /* Periodic boundary handling: replace the boundary self-joins that
+       * find_neighbors just emitted on periodic faces with proper
+       * slave↔master joins (mirror image trees on the periodic wraparound).
+       * Skips silently when periodic_links is empty. */
+      if (!periodic_links.empty ()) {
+        const auto periodic_faces
+          = t8_cmesh_msh_file_compute_periodic_face_set (*indices, periodic_links, cmesh);
+        t8_cmesh_msh_file_scrub_periodic_self_joins (cmesh, periodic_faces);
+        t8_cmesh_msh_file_emit_periodic_joins (cmesh, *indices, periodic_links);
+      }
+    }
 
     main_proc_read_successful = 1;
   }
