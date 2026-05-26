@@ -1066,6 +1066,18 @@ t8_cmesh_process_tree_geometry (const t8_cmesh_t cmesh, const t8_eclass_t eclass
         }
       }
 
+      /* Fallback: both endpoints sit at seam-vertices of a closed CAD edge, so neither endpoint
+       * alone disambiguates which side of the seam this mesh-edge belongs to. Sample the midpoint
+       * of the CAD edge's parametric range as the reference -- by construction strictly interior
+       * to [first, last], hence not at the seam, hence a valid disambiguator for the downstream
+       * t8_geom_get_parameter_of_vertex_on_edge call. */
+      if (!reference_param.has_value ()) {
+        double edge_bounds[2];
+        cad_geometry->get_cad_manager ()->t8_geom_get_edge_parametric_bounds (edge_geometry_tag, edge_bounds);
+        T8_ASSERT (edge_bounds[0] != edge_bounds[1]);
+        reference_param = 0.5 * (edge_bounds[0] + edge_bounds[1]);
+      }
+
       if (!reference_param.has_value ()) {
         t8_global_errorf ("Error during mesh-cad recombination: Reference parameter on curve not found.\n");
         return 0;
@@ -1162,6 +1174,20 @@ t8_cmesh_process_tree_geometry (const t8_cmesh_t cmesh, const t8_eclass_t eclass
             SC_ABORT_NOT_REACHED ();
           }
         }
+      }
+
+      /* Fallback (analogous to the edge-on-curve case above): both endpoints sit on seam-edges
+       * or seam-vertices of a closed CAD face, so neither alone disambiguates the parametric
+       * branch. Sample the centroid of the CAD face's parametric range as the reference --
+       * interior to the (u, v) bounding rectangle, hence not on a seam edge, hence a valid
+       * disambiguator. */
+      if (!reference_params.has_value ()) {
+        double face_bounds[4]; /* OCC Geom_Surface::Bounds layout: [u_min, u_max, v_min, v_max]. */
+        cad_geometry->get_cad_manager ()->t8_geom_get_face_parametric_bounds (edge_geometry_tag, face_bounds);
+        T8_ASSERT (face_bounds[0] != face_bounds[1]);
+        T8_ASSERT (face_bounds[2] != face_bounds[3]);
+        reference_params
+          = std::array<double, 2> { 0.5 * (face_bounds[0] + face_bounds[1]), 0.5 * (face_bounds[2] + face_bounds[3]) };
       }
 
       if (!reference_params.has_value ()) {
