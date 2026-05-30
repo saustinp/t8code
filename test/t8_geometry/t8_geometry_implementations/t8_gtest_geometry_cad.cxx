@@ -46,8 +46,18 @@
 #include <TColgp_Array2OfPnt.hxx>
 #include <Geom_BSplineCurve.hxx>
 #include <Geom_BSplineSurface.hxx>
+#include <Geom_Circle.hxx>
+#include <Geom_CylindricalSurface.hxx>
+#include <gp_Circ.hxx>
+#include <gp_Cylinder.hxx>
+#include <gp_Ax2.hxx>
+#include <gp_Ax3.hxx>
+#include <gp_Dir.hxx>
+#include <gp_Pnt.hxx>
 #include <TopoDS_Face.hxx>
 #include <TopoDS_Edge.hxx>
+#include <TopoDS.hxx>
+#include <BRep_Tool.hxx>
 #include <t8_element/t8_element.h>
 
 #include <test/t8_gtest_custom_assertion.hxx>
@@ -1075,4 +1085,310 @@ TEST (t8_gtest_geometry_cad_prism, linked_edges)
   for (int i_edges = 0; i_edges < 9; ++i_edges) {
     t8_test_geometry_cad_prism (-1, i_edges, curve_parameters + i_edges * 2, test_ref_coords, curve_test_return_coords);
   }
+}
+
+/* ====================================================================== *
+ * Periodic-seam projection tests.
+ *
+ * These tests guard against a bug in which the cad geometry linearly
+ * interpolated the two stored CAD parameters of a mesh edge/face that
+ * straddles the closure ("seam") of a periodic CAD curve or surface
+ * without unwrapping across the period. The interpolation then traversed
+ * the long arc around the parametric loop, so the high-order nodes were
+ * placed on the far side of the geometry (e.g. the antipodal point of a
+ * circle) instead of along the short arc where the element actually lives.
+ * ====================================================================== */
+
+/** Builds a full circle of radius 1 centred at the origin in the x-y plane.
+ * A full circle is a periodic CAD curve (period 2*pi), so it exercises the
+ * periodic-seam unwrap. The curve is wrapped into a TopoDS_Edge so it can be
+ * linked to a cmesh edge like the other test curves. */
+static TopoDS_Shape
+t8_create_cad_periodic_circle_shape ()
+{
+  const gp_Circ circle (gp_Ax2 (gp_Pnt (0, 0, 0), gp_Dir (0, 0, 1)), 1.0);
+  Handle_Geom_Circle geom_circle = new Geom_Circle (circle);
+  return BRepBuilderAPI_MakeEdge (geom_circle).Edge ();
+}
+
+/* Links a periodic circle to one edge of a single quad and evaluates the
+ * high-order node at the midpoint of that edge. The edge straddles the
+ * circle's seam (its two vertices sit at parameters 7*pi/4 and pi/4). The
+ * short arc between them passes through parameter 0 == 2*pi, i.e. the point
+ * (1, 0, 0). Before the unwrap fix the evaluator interpolated to parameter
+ * pi and returned the antipodal point (-1, 0, 0). */
+TEST (t8_gtest_geometry_cad_periodic, quad_curve_seam)
+{
+  const double radius = 1.0;
+  const double p0 = 7.0 * M_PI / 4.0; /* 315 degrees, just before the seam */
+  const double p1 = 1.0 * M_PI / 4.0; /*  45 degrees, just after the seam  */
+
+  /* Physical positions of the two seam-straddling edge endpoints. */
+  const double v0x = radius * cos (p0), v0y = radius * sin (p0); /* ( 0.707, -0.707) */
+  const double v1x = radius * cos (p1), v1y = radius * sin (p1); /* ( 0.707,  0.707) */
+
+  /* Quad vertices in zorder (v0, v1, v2, v3). The curve is linked to edge 2,
+   * which connects corners 0 and 1. v2 and v3 are placed outward (+x) so the
+   * quad is non-degenerate; they do not influence the on-edge evaluation. */
+  /* clang-format off */
+  double vertices[12] = {
+    v0x,       v0y, 0.0,   /* v0 (corner 0) */
+    v1x,       v1y, 0.0,   /* v1 (corner 1) */
+    v0x + 1.0, v0y, 0.0,   /* v2 (corner 2) */
+    v1x + 1.0, v1y, 0.0    /* v3 (corner 3) */
+  };
+  /* clang-format on */
+
+  const int linked_edge = 2;
+  int faces[1] = { 0 };
+  int edges[8] = { 0 };
+  edges[linked_edge] = 1; /* link curve index 1 (the circle) to edge 2 */
+  double params[2] = { p0, p1 };
+
+  t8_cmesh_t cmesh;
+  t8_cmesh_init (&cmesh);
+  t8_cmesh_set_tree_class (cmesh, 0, T8_ECLASS_QUAD);
+  t8_cmesh_register_geometry<t8_geometry_cad> (cmesh, t8_create_cad_periodic_circle_shape ());
+  t8_cmesh_set_tree_vertices (cmesh, 0, vertices, 4);
+  t8_cmesh_set_attribute (cmesh, 0, t8_get_package_id (), T8_CMESH_CAD_FACE_ATTRIBUTE_KEY, faces, sizeof (int), 0);
+  t8_cmesh_set_attribute (cmesh, 0, t8_get_package_id (), T8_CMESH_CAD_EDGE_ATTRIBUTE_KEY, edges, 8 * sizeof (int), 0);
+  t8_cmesh_set_attribute (cmesh, 0, t8_get_package_id (), T8_CMESH_CAD_EDGE_PARAMETERS_ATTRIBUTE_KEY + linked_edge,
+                          params, 2 * sizeof (double), 0);
+  t8_cmesh_commit (cmesh, sc_MPI_COMM_WORLD);
+
+  /* Evaluate the high-order node at the midpoint of the curved (bottom) edge.
+   * The short-arc midpoint is parameter 2*pi == 0, i.e. (radius, 0, 0). */
+  double ref_coords[2] = { 0.5, 0.0 };
+  t8_3D_vec out_coords;
+  t8_geometry_evaluate (cmesh, 0, ref_coords, 1, out_coords.data ());
+
+  const t8_3D_vec expected ({ radius, 0.0, 0.0 });
+  EXPECT_VEC_EQ (out_coords, expected, 1e-9);
+
+  t8_cmesh_destroy (&cmesh);
+}
+
+/* Same scenario as quad_curve_seam, but for a hexahedron, exercising the 3D
+ * curve-projection path (t8_geom_evaluate_cad_hex -> process_curve). The
+ * periodic circle is linked to edge 0, which connects corners 0 and 1 and
+ * straddles the seam. Evaluating at the midpoint of that edge must land on the
+ * short-arc point (radius, 0, 0), not the antipodal point. */
+TEST (t8_gtest_geometry_cad_periodic, hex_curve_seam)
+{
+  const double radius = 1.0;
+  const double p0 = 7.0 * M_PI / 4.0;
+  const double p1 = 1.0 * M_PI / 4.0;
+  const double v0x = radius * cos (p0), v0y = radius * sin (p0);
+  const double v1x = radius * cos (p1), v1y = radius * sin (p1);
+
+  /* Hex vertices in zorder. Edge 0 connects corners 0 and 1. Corners 0 and 1
+   * sit on the circle straddling the seam; the remaining corners are offset in
+   * +x and +z so the hex is non-degenerate but do not affect the on-edge
+   * evaluation at ref (0.5, 0, 0). */
+  /* clang-format off */
+  double vertices[24] = {
+    v0x,       v0y, 0.0,   /* corner 0 */
+    v1x,       v1y, 0.0,   /* corner 1 */
+    v0x + 1.0, v0y, 0.0,   /* corner 2 */
+    v1x + 1.0, v1y, 0.0,   /* corner 3 */
+    v0x,       v0y, 1.0,   /* corner 4 */
+    v1x,       v1y, 1.0,   /* corner 5 */
+    v0x + 1.0, v0y, 1.0,   /* corner 6 */
+    v1x + 1.0, v1y, 1.0    /* corner 7 */
+  };
+  /* clang-format on */
+
+  const int linked_edge = 0;
+  int faces[6] = { 0 };
+  int edges[24] = { 0 };
+  edges[linked_edge] = 1; /* link curve index 1 (the circle) to edge 0 */
+  double params[2] = { p0, p1 };
+
+  t8_cmesh_t cmesh;
+  t8_cmesh_init (&cmesh);
+  t8_cmesh_set_tree_class (cmesh, 0, T8_ECLASS_HEX);
+  t8_cmesh_register_geometry<t8_geometry_cad> (cmesh, t8_create_cad_periodic_circle_shape ());
+  t8_cmesh_set_tree_vertices (cmesh, 0, vertices, 8);
+  t8_cmesh_set_attribute (cmesh, 0, t8_get_package_id (), T8_CMESH_CAD_FACE_ATTRIBUTE_KEY, faces, 6 * sizeof (int), 0);
+  t8_cmesh_set_attribute (cmesh, 0, t8_get_package_id (), T8_CMESH_CAD_EDGE_ATTRIBUTE_KEY, edges, 24 * sizeof (int), 0);
+  t8_cmesh_set_attribute (cmesh, 0, t8_get_package_id (), T8_CMESH_CAD_EDGE_PARAMETERS_ATTRIBUTE_KEY + linked_edge,
+                          params, 2 * sizeof (double), 0);
+  t8_cmesh_commit (cmesh, sc_MPI_COMM_WORLD);
+
+  double ref_coords[3] = { 0.5, 0.0, 0.0 };
+  t8_3D_vec out_coords;
+  t8_geometry_evaluate (cmesh, 0, ref_coords, 1, out_coords.data ());
+
+  const t8_3D_vec expected ({ radius, 0.0, 0.0 });
+  EXPECT_VEC_EQ (out_coords, expected, 1e-9);
+
+  t8_cmesh_destroy (&cmesh);
+}
+
+/** Builds a *clamped* (non-periodic) B-spline curve that closes on itself by
+ * interpolating eight points around the unit circle plus a ninth point equal
+ * to the first. GeomAPI_PointsToBSpline returns a clamped curve, so
+ * IsPeriodic() is false even though the geometry closes (FirstParameter and
+ * LastParameter map to the same point). This is the representation that the
+ * gmsh-imported "organic_shape" mesh actually uses, and the one the
+ * IsPeriodic()-only check would miss. */
+static TopoDS_Shape
+t8_create_cad_clamped_closed_curve_shape ()
+{
+  TColgp_Array1OfPnt point_array (1, 9);
+  for (int i = 0; i < 8; ++i) {
+    const double angle = 2.0 * M_PI * i / 8.0;
+    point_array (i + 1) = gp_Pnt (cos (angle), sin (angle), 0.0);
+  }
+  point_array (9) = point_array (1); /* close the loop: last point == first */
+  Handle_Geom_Curve curve = GeomAPI_PointsToBSpline (point_array).Curve ();
+  return BRepBuilderAPI_MakeEdge (curve).Edge ();
+}
+
+/* Links a CLAMPED (non-periodic) but geometrically closed B-spline to a quad
+ * edge straddling its seam. This is the representation OpenCASCADE hands back
+ * for the gmsh "organic_shape" hole, so it exercises the coincident-endpoint
+ * closed-curve detection and the out-of-range parameter fold-back that the
+ * plain IsPeriodic() check cannot. The evaluated edge midpoint must lie on the
+ * short arc near the seam, not on the long arc across the loop.
+ *
+ * Ground truth is taken from OCC's own curve evaluation (process_curve maps a
+ * single parameter to a point), so this checks the evaluator's parameter
+ * handling rather than re-deriving the B-spline geometry. */
+TEST (t8_gtest_geometry_cad_periodic, quad_clamped_closed_curve_seam)
+{
+  const TopoDS_Shape shape = t8_create_cad_clamped_closed_curve_shape ();
+  const TopoDS_Edge edge = TopoDS::Edge (shape);
+  Standard_Real first = 0.0, last = 0.0;
+  const Handle_Geom_Curve curve = BRep_Tool::Curve (edge, first, last);
+  ASSERT_FALSE (curve.IsNull ());
+  /* The whole point: clamped representation reports non-periodic ... */
+  ASSERT_FALSE (curve->IsPeriodic ());
+  /* ... but the endpoints coincide, so the curve is closed. */
+  gp_Pnt point_first, point_last;
+  curve->D0 (first, point_first);
+  curve->D0 (last, point_last);
+  ASSERT_LE (point_first.Distance (point_last), 1e-9);
+
+  const double period = last - first;
+  /* Edge straddles the seam: one vertex at the seam (param first), the other
+   * near the far end (param first + 0.9*period, physically near the seam). */
+  const double p0 = first;
+  const double p1 = first + 0.9 * period;
+
+  gp_Pnt curve_v0, curve_v1;
+  curve->D0 (p0, curve_v0);
+  curve->D0 (p1, curve_v1);
+
+  /* clang-format off */
+  double vertices[12] = {
+    curve_v0.X (),       curve_v0.Y (), 0.0,   /* v0 (corner 0) */
+    curve_v1.X (),       curve_v1.Y (), 0.0,   /* v1 (corner 1) */
+    curve_v0.X () + 1.0, curve_v0.Y (), 0.0,   /* v2 (corner 2) */
+    curve_v1.X () + 1.0, curve_v1.Y (), 0.0    /* v3 (corner 3) */
+  };
+  /* clang-format on */
+
+  const int linked_edge = 2;
+  int faces[1] = { 0 };
+  int edges[8] = { 0 };
+  edges[linked_edge] = 1;
+  double params[2] = { p0, p1 };
+
+  t8_cmesh_t cmesh;
+  t8_cmesh_init (&cmesh);
+  t8_cmesh_set_tree_class (cmesh, 0, T8_ECLASS_QUAD);
+  t8_cmesh_register_geometry<t8_geometry_cad> (cmesh, shape);
+  t8_cmesh_set_tree_vertices (cmesh, 0, vertices, 4);
+  t8_cmesh_set_attribute (cmesh, 0, t8_get_package_id (), T8_CMESH_CAD_FACE_ATTRIBUTE_KEY, faces, sizeof (int), 0);
+  t8_cmesh_set_attribute (cmesh, 0, t8_get_package_id (), T8_CMESH_CAD_EDGE_ATTRIBUTE_KEY, edges, 8 * sizeof (int), 0);
+  t8_cmesh_set_attribute (cmesh, 0, t8_get_package_id (), T8_CMESH_CAD_EDGE_PARAMETERS_ATTRIBUTE_KEY + linked_edge,
+                          params, 2 * sizeof (double), 0);
+  t8_cmesh_commit (cmesh, sc_MPI_COMM_WORLD);
+
+  double ref_coords[2] = { 0.5, 0.0 };
+  t8_3D_vec out_coords;
+  t8_geometry_evaluate (cmesh, 0, ref_coords, 1, out_coords.data ());
+
+  /* Short-arc midpoint parameter: unwrap (p1 -= period) then interpolate at
+   * 0.5 then fold back into [first, last]. Long-arc (buggy) midpoint is the
+   * naive interpolation of the stored parameters. */
+  gp_Pnt expected_pnt, buggy_pnt;
+  curve->D0 (last - 0.05 * period, expected_pnt);
+  curve->D0 (first + 0.45 * period, buggy_pnt);
+  const t8_3D_vec expected ({ expected_pnt.X (), expected_pnt.Y (), expected_pnt.Z () });
+  EXPECT_VEC_EQ (out_coords, expected, 1e-9);
+
+  /* And sanity: clearly not the long-arc point on the far side of the loop. */
+  const double dist_to_buggy = std::sqrt ((out_coords[0] - buggy_pnt.X ()) * (out_coords[0] - buggy_pnt.X ())
+                                          + (out_coords[1] - buggy_pnt.Y ()) * (out_coords[1] - buggy_pnt.Y ()));
+  EXPECT_GT (dist_to_buggy, 1.0);
+
+  t8_cmesh_destroy (&cmesh);
+}
+
+/** Builds a cylinder of radius 1 about the z-axis. A cylinder is periodic in
+ * its u-direction (the angular parameter, period 2*pi) and non-periodic in v
+ * (the axial parameter), so it exercises the surface-seam unwrap in u only.
+ * The surface is wrapped into a face so it can be linked to a cmesh edge. */
+static TopoDS_Shape
+t8_create_cad_periodic_cylinder_shape ()
+{
+  const gp_Cylinder cylinder (gp_Ax3 (gp_Pnt (0, 0, 0), gp_Dir (0, 0, 1)), 1.0);
+  Handle_Geom_CylindricalSurface geom_cylinder = new Geom_CylindricalSurface (cylinder);
+  return BRepBuilderAPI_MakeFace (geom_cylinder, 1e-6).Face ();
+}
+
+/* Links a periodic cylinder surface to one edge of a quad and evaluates the
+ * high-order node at the midpoint of that edge. The edge straddles the
+ * cylinder's u-seam: its endpoints sit at (u, v) = (7*pi/4, 0) and (pi/4, 0).
+ * The short arc in u passes through u = 0 == 2*pi, i.e. the point
+ * (radius, 0, 0). Before the unwrap fix the evaluator interpolated to u = pi
+ * and returned the antipodal point (-radius, 0, 0). */
+TEST (t8_gtest_geometry_cad_periodic, quad_surface_seam)
+{
+  const double radius = 1.0;
+  const double u0 = 7.0 * M_PI / 4.0;
+  const double u1 = 1.0 * M_PI / 4.0;
+  const double v0x = radius * cos (u0), v0y = radius * sin (u0);
+  const double v1x = radius * cos (u1), v1y = radius * sin (u1);
+
+  /* clang-format off */
+  double vertices[12] = {
+    v0x,       v0y, 0.0,   /* v0 (corner 0) */
+    v1x,       v1y, 0.0,   /* v1 (corner 1) */
+    v0x + 1.0, v0y, 0.0,   /* v2 (corner 2) */
+    v1x + 1.0, v1y, 0.0    /* v3 (corner 3) */
+  };
+  /* clang-format on */
+
+  const int num_edges = 4;
+  const int linked_edge = 2;
+  int faces[1] = { 0 };
+  int edges[8] = { 0 };
+  /* Link surface index 1 (the cylinder) to edge 2. Surfaces are stored in the
+   * second half of the per-edge linkage array. */
+  edges[linked_edge + num_edges] = 1;
+  /* Surface parameters at the edge's two vertices, laid out u0, v0, u1, v1. */
+  double params[4] = { u0, 0.0, u1, 0.0 };
+
+  t8_cmesh_t cmesh;
+  t8_cmesh_init (&cmesh);
+  t8_cmesh_set_tree_class (cmesh, 0, T8_ECLASS_QUAD);
+  t8_cmesh_register_geometry<t8_geometry_cad> (cmesh, t8_create_cad_periodic_cylinder_shape ());
+  t8_cmesh_set_tree_vertices (cmesh, 0, vertices, 4);
+  t8_cmesh_set_attribute (cmesh, 0, t8_get_package_id (), T8_CMESH_CAD_FACE_ATTRIBUTE_KEY, faces, sizeof (int), 0);
+  t8_cmesh_set_attribute (cmesh, 0, t8_get_package_id (), T8_CMESH_CAD_EDGE_ATTRIBUTE_KEY, edges, 8 * sizeof (int), 0);
+  t8_cmesh_set_attribute (cmesh, 0, t8_get_package_id (), T8_CMESH_CAD_EDGE_PARAMETERS_ATTRIBUTE_KEY + linked_edge,
+                          params, 4 * sizeof (double), 0);
+  t8_cmesh_commit (cmesh, sc_MPI_COMM_WORLD);
+
+  double ref_coords[2] = { 0.5, 0.0 };
+  t8_3D_vec out_coords;
+  t8_geometry_evaluate (cmesh, 0, ref_coords, 1, out_coords.data ());
+
+  const t8_3D_vec expected ({ radius, 0.0, 0.0 });
+  EXPECT_VEC_EQ (out_coords, expected, 1e-9);
+
+  t8_cmesh_destroy (&cmesh);
 }

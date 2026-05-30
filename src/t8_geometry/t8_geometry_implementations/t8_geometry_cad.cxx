@@ -45,6 +45,8 @@
 #include <TopoDS_Face.hxx>
 #include <Geom_Surface.hxx>
 #include <Geom_Curve.hxx>
+#include <Precision.hxx>
+#include <cmath>
 
 /** The lookup table contains the coordinate of each edge of a tetrahedron,
  * which is used for the interpolation.
@@ -53,6 +55,204 @@ const int t8_interpolation_coefficient_tet_edge[6] = { 0, 0, 0, 2, 2, 1 };
 /** The lookup table contains the coordinates of each face of a tetrahedron.
  * For example: face 0 is described by coordinates z and y. */
 const int t8_face_ref_coords_tet[4][2] = { { 2, 1 }, { 0, 1 }, { 0, 1 }, { 0, 2 } };
+
+/** \brief Test whether a CAD curve closes on itself, i.e. has a parametric
+ * seam where its end rejoins its start.
+ *
+ * Two flavours of closed curve occur in practice:
+ *   - genuinely periodic curves (\c IsPeriodic() == true), e.g. a full circle;
+ *   - clamped curves whose first and last points coincide, e.g. a closed
+ *     B-spline imported with boundary knot multiplicity equal to the degree.
+ *     OpenCASCADE often hands these back with \c IsPeriodic() == false even
+ *     though the curve geometrically closes — this is the case that bites the
+ *     gmsh-imported "organic_shape" mesh.
+ *
+ * Both flavours have a seam at \c FirstParameter() == \c LastParameter() that a
+ * mesh edge can straddle, so both must be unwrapped.
+ *
+ * \param [in] curve  The CAD curve.
+ * \return            True if the curve is periodic or its endpoints coincide.
+ */
+static inline bool
+t8_geom_cad_curve_is_closed (const Handle_Geom_Curve &curve)
+{
+  if (curve.IsNull ()) {
+    return false;
+  }
+  if (curve->IsPeriodic ()) {
+    return true;
+  }
+  gp_Pnt point_first, point_last;
+  curve->D0 (curve->FirstParameter (), point_first);
+  curve->D0 (curve->LastParameter (), point_last);
+  return point_first.Distance (point_last) <= Precision::Confusion ();
+}
+
+/** \brief Unwrap the two endpoint parameters of a mesh edge across a closed
+ * CAD curve's seam, so that a subsequent linear interpolation of the
+ * parameters traverses the short arc of the curve.
+ *
+ * The cad evaluator places high-order edge nodes by linearly interpolating the
+ * two CAD parameters stored at the edge's vertices and evaluating the curve at
+ * the result. For a closed curve an edge that straddles the curve's closure
+ * ("seam") has endpoint parameters on opposite sides of the parameter range
+ * (e.g. 0.0 and 0.98 on a [0,1] domain). A naive linear interpolation then
+ * traverses the long arc (through the middle of the range) instead of the
+ * short arc across the seam, placing the nodes on the far side of the geometry.
+ *
+ * This helper rewrites the second parameter by +/- one period (= the parameter
+ * span LastParameter() - FirstParameter()) so that the two parameters differ
+ * by at most half a period, i.e. the interpolation follows the short arc. The
+ * rewritten parameter may fall outside [FirstParameter, LastParameter]; the
+ * interpolated result is folded back into range by \ref
+ * t8_geom_cad_reduce_closed_curve_param before the curve is evaluated.
+ *
+ * The unwrap is applied only when the parameters actually straddle (their
+ * difference exceeds half the span) AND the curve is closed. The first test is
+ * cheap and short-circuits the common, non-seam case; the (slightly more
+ * expensive) closed test then guards against mis-unwrapping a genuinely long
+ * edge of an open curve. For a null curve the parameters are copied unchanged.
+ *
+ * \param [in]  curve       The CAD curve the edge is linked to.
+ * \param [in]  params_in   The two stored endpoint parameters.
+ * \param [out] params_out  The (possibly unwrapped) endpoint parameters. May
+ *                          point to the same storage as \a params_in.
+ */
+static inline void
+t8_geom_cad_unwrap_periodic_curve_parameters (const Handle_Geom_Curve &curve, const double *params_in,
+                                              double *params_out)
+{
+  params_out[0] = params_in[0];
+  params_out[1] = params_in[1];
+  if (curve.IsNull ()) {
+    return;
+  }
+  const double period = curve->LastParameter () - curve->FirstParameter ();
+  if (period <= 0.0) {
+    return;
+  }
+  const double diff = params_out[1] - params_out[0];
+  /* Common case: the edge is a short arc, no seam straddle -> nothing to do
+   * (and no need to probe the curve for closedness). */
+  if (diff <= 0.5 * period && diff >= -0.5 * period) {
+    return;
+  }
+  /* The parameters straddle. Only unwrap if the curve actually closes;
+   * otherwise this is a genuinely long edge of an open curve. */
+  if (!t8_geom_cad_curve_is_closed (curve)) {
+    return;
+  }
+  if (diff > 0.5 * period) {
+    params_out[1] -= period;
+  }
+  else {
+    params_out[1] += period;
+  }
+}
+
+/** \brief Fold a (possibly seam-unwrapped) curve parameter back into the
+ * curve's declared parameter range [FirstParameter, LastParameter].
+ *
+ * \ref t8_geom_cad_unwrap_periodic_curve_parameters may produce an interpolated
+ * parameter slightly outside the declared range (on the short side of the
+ * seam). For a genuinely periodic curve OCC's Geom_Curve::D0 reduces such a
+ * parameter modulo the period internally, but for a clamped-but-closed curve it
+ * would instead extrapolate the boundary polynomial and return a wrong point.
+ * This helper reduces the parameter modulo the period so the closed curve is
+ * always evaluated within its valid range.
+ *
+ * A parameter already within range is returned unchanged. An out-of-range
+ * parameter only ever arises from the seam unwrap above, which fires solely for
+ * closed curves; the closed test here is a defensive double-check.
+ *
+ * \param [in] curve  The CAD curve.
+ * \param [in] param  The parameter to fold.
+ * \return            The parameter folded into [FirstParameter, LastParameter].
+ */
+static inline double
+t8_geom_cad_reduce_closed_curve_param (const Handle_Geom_Curve &curve, const double param)
+{
+  if (curve.IsNull ()) {
+    return param;
+  }
+  const double first = curve->FirstParameter ();
+  const double last = curve->LastParameter ();
+  if (param >= first && param <= last) {
+    return param;
+  }
+  if (!t8_geom_cad_curve_is_closed (curve)) {
+    return param;
+  }
+  const double period = last - first;
+  if (period <= 0.0) {
+    return param;
+  }
+  double reduced = first + std::fmod (param - first, period);
+  if (reduced < first) {
+    reduced += period;
+  }
+  return reduced;
+}
+
+/** \brief Unwrap the corner parameters of a mesh edge/face across a periodic
+ * CAD surface's u- and/or v-seam.
+ *
+ * This is the surface analogue of \ref
+ * t8_geom_cad_unwrap_periodic_curve_parameters. A surface can be periodic in u
+ * (e.g. a cylinder), in v, or in both (e.g. a torus). Each direction is
+ * unwrapped independently: every corner's parameter is shifted by +/- one
+ * period so that it lies within half a period of the first corner, keeping the
+ * interpolation on the short arc in that direction.
+ *
+ * For a non-periodic (or null) surface the parameters are copied through
+ * unchanged.
+ *
+ * \param [in]  surface      The CAD surface.
+ * \param [in]  num_corners  Number of (u,v) corner pairs in the arrays (2 for
+ *                           an edge on a surface, 3 or 4 for a face).
+ * \param [in]  params_in    num_corners (u,v) pairs, laid out u0,v0,u1,v1,...
+ * \param [out] params_out   The (possibly unwrapped) (u,v) pairs. May point to
+ *                           the same storage as \a params_in.
+ */
+static inline void
+t8_geom_cad_unwrap_periodic_surface_parameters (const Handle_Geom_Surface &surface, const int num_corners,
+                                                const double *params_in, double *params_out)
+{
+  for (int i = 0; i < 2 * num_corners; ++i) {
+    params_out[i] = params_in[i];
+  }
+  if (surface.IsNull ()) {
+    return;
+  }
+  const bool u_periodic = surface->IsUPeriodic ();
+  const bool v_periodic = surface->IsVPeriodic ();
+  if (!u_periodic && !v_periodic) {
+    return;
+  }
+  const double u_period = u_periodic ? surface->UPeriod () : 0.0;
+  const double v_period = v_periodic ? surface->VPeriod () : 0.0;
+  /* Reference every corner to the first one. */
+  for (int corner = 1; corner < num_corners; ++corner) {
+    if (u_periodic) {
+      const double diff = params_out[2 * corner] - params_out[0];
+      if (diff > 0.5 * u_period) {
+        params_out[2 * corner] -= u_period;
+      }
+      else if (diff < -0.5 * u_period) {
+        params_out[2 * corner] += u_period;
+      }
+    }
+    if (v_periodic) {
+      const double diff = params_out[2 * corner + 1] - params_out[1];
+      if (diff > 0.5 * v_period) {
+        params_out[2 * corner + 1] -= v_period;
+      }
+      else if (diff < -0.5 * v_period) {
+        params_out[2 * corner + 1] += v_period;
+      }
+    }
+  }
+}
 
 t8_geometry_cad::t8_geometry_cad (std::string fileprefix, std::string name_in): t8_geometry_with_vertices (name_in)
 {
@@ -223,12 +423,18 @@ t8_geometry_cad::t8_geom_evaluate_cad_tri (t8_cmesh_t cmesh, t8_gloidx_t gtreeid
           cmesh, t8_get_package_id (), T8_CMESH_CAD_EDGE_PARAMETERS_ATTRIBUTE_KEY + i_edge, ltreeid);
         T8_ASSERT (edge_parameters != NULL);
 
+        /* Unwrap the periodic-seam curve parameter pair so the interpolation
+         * follows the short arc (no-op for non-periodic curves). */
+        double unwrapped_edge_parameters[2];
+        t8_geom_cad_unwrap_periodic_curve_parameters (cad_manager->t8_geom_get_cad_curve (active_edges()[i_edge]),
+                                                      edge_parameters, unwrapped_edge_parameters);
+
         /* Calculate the curve parameter at the intersection point for each reference coordinate */
         for (size_t i_coord = 0; i_coord < num_coords; ++i_coord) {
           const int offset_2d = i_coord * 2;
           /* If the current edge is edge 0, we use the y coordinate of the ref intersection.
            * For all other edges we can use the x coordinate. */
-          t8_geom_linear_interpolation (&ref_intersection[(i_edge == 0) + offset_2d], edge_parameters, 1, 1,
+          t8_geom_linear_interpolation (&ref_intersection[(i_edge == 0) + offset_2d], unwrapped_edge_parameters, 1, 1,
                                         &interpolated_curve_parameter);
           /* Convert the interpolated edge parameter of each reference point to surface parameters */
           cad_manager->t8_geom_edge_parameter_to_face_parameters (active_edges()[i_edge], (*active_faces()), interpolated_curve_parameter,
@@ -309,18 +515,32 @@ t8_geometry_cad::t8_geom_evaluate_cad_tri (t8_cmesh_t cmesh, t8_gloidx_t gtreeid
         t8_geom_compute_linear_geometry (active_tree_class(), active_tree_vertices(), ref_intersection, num_coords,
                                          glob_intersection);
 
+        /* Unwrap the periodic-seam parameters of the linked curve/surface so
+         * the interpolation below follows the short arc. No-op for the
+         * non-periodic case. */
+        double unwrapped_parameters[4];
+        if (active_edges()[i_edge] > 0) {
+          t8_geom_cad_unwrap_periodic_curve_parameters (
+            cad_manager->t8_geom_get_cad_curve (active_edges()[i_edge]), parameters, unwrapped_parameters);
+        }
+        else {
+          t8_geom_cad_unwrap_periodic_surface_parameters (
+            cad_manager->t8_geom_get_cad_surface (active_edges()[i_edge + num_edges]), 2, parameters,
+            unwrapped_parameters);
+        }
+
         for (size_t i_coord = 0; i_coord < num_coords; ++i_coord) {
           const int offset_2d = i_coord * 2;
           const int offset_3d = i_coord * 3;
           if (active_edges()[i_edge] > 0) {
             /* Interpolate between the curve parameters of the current edge with the ref_intersection of each reference point */
-            t8_geom_linear_interpolation (&ref_intersection[(i_edge == 0) + offset_2d], parameters, 1, 1,
+            t8_geom_linear_interpolation (&ref_intersection[(i_edge == 0) + offset_2d], unwrapped_parameters, 1, 1,
                                           &interpolated_curve_parameter);
             pnt = process_curve (active_edges()[i_edge], interpolated_curve_parameter);
           }
           else {
             /* Interpolate between the surface parameters of the current edge with the ref_intersection of each reference point */
-            t8_geom_linear_interpolation (&ref_intersection[(i_edge == 0) + offset_2d], parameters, 2, 1,
+            t8_geom_linear_interpolation (&ref_intersection[(i_edge == 0) + offset_2d], unwrapped_parameters, 2, 1,
                                           interpolated_surface_parameters + offset_2d);
 
             pnt = process_surface (active_edges()[i_edge + num_edges], interpolated_surface_parameters + offset_2d);
@@ -405,12 +625,18 @@ t8_geometry_cad::t8_geom_evaluate_cad_quad (t8_cmesh_t cmesh, t8_gloidx_t gtreei
           cmesh, t8_get_package_id (), T8_CMESH_CAD_EDGE_PARAMETERS_ATTRIBUTE_KEY + i_edge, ltreeid);
         T8_ASSERT (edge_parameters != NULL);
 
+        /* Unwrap the periodic-seam curve parameter pair so the interpolation
+         * follows the short arc (no-op for non-periodic curves). */
+        double unwrapped_edge_parameters[2];
+        t8_geom_cad_unwrap_periodic_curve_parameters (cad_manager->t8_geom_get_cad_curve (active_edges()[i_edge]),
+                                                      edge_parameters, unwrapped_edge_parameters);
+
         for (size_t coord = 0; coord < num_coords; ++coord) {
           const int offset_3d = coord * 3;
           const int offset_2d = coord * 2;
 
           /* Interpolate between curve parameters and surface parameters of the same nodes */
-          t8_geom_linear_interpolation (&ref_coords[edge_direction + offset_2d], edge_parameters, 1, 1,
+          t8_geom_linear_interpolation (&ref_coords[edge_direction + offset_2d], unwrapped_edge_parameters, 1, 1,
                                         temp_edge_parameters);
 
           /* Convert curve parameter to surface parameters */
@@ -502,6 +728,12 @@ t8_geometry_cad::t8_geom_evaluate_cad_quad (t8_cmesh_t cmesh, t8_gloidx_t gtreei
           /* Check if curve are valid */
           T8_ASSERT (!curve.IsNull ());
 
+          /* Unwrap the periodic-seam parameter pair so that the linear
+           * interpolation below follows the short arc of the curve. This is a
+           * no-op for non-periodic curves. */
+          double unwrapped_parameters[2];
+          t8_geom_cad_unwrap_periodic_curve_parameters (curve, parameters, unwrapped_parameters);
+
           for (size_t coord = 0; coord < num_coords; ++coord) {
             const int offset_3d = coord * 3;
             const int offset_2d = coord * 2;
@@ -510,9 +742,11 @@ t8_geometry_cad::t8_geom_evaluate_cad_quad (t8_cmesh_t cmesh, t8_gloidx_t gtreei
                                           temp_coords);
 
             /* Linear interpolation between parameters */
-            t8_geom_linear_interpolation (&ref_coords[edge_direction + offset_2d], parameters, 1, 1, temp_parameters);
-            /* Calculate point on curve with interpolated parameters. */
-            curve->D0 (temp_parameters[0], pnt);
+            t8_geom_linear_interpolation (&ref_coords[edge_direction + offset_2d], unwrapped_parameters, 1, 1,
+                                          temp_parameters);
+            /* Calculate point on curve with interpolated parameters (folding a
+             * seam-unwrapped parameter back into range for closed curves). */
+            curve->D0 (t8_geom_cad_reduce_closed_curve_param (curve, temp_parameters[0]), pnt);
 
             /* Calculate scaling factor for edge */
             for (int dim = 0; dim < 3; ++dim) {
@@ -534,6 +768,12 @@ t8_geometry_cad::t8_geom_evaluate_cad_quad (t8_cmesh_t cmesh, t8_gloidx_t gtreei
           /* Check if surface is valid */
           T8_ASSERT (!surface.IsNull ());
 
+          /* Unwrap the periodic-seam (u,v) pairs so that the linear
+           * interpolation below follows the short arc of the surface in each
+           * direction. This is a no-op for non-periodic surfaces. */
+          double unwrapped_parameters[4];
+          t8_geom_cad_unwrap_periodic_surface_parameters (surface, 2, parameters, unwrapped_parameters);
+
           for (size_t coord = 0; coord < num_coords; ++coord) {
             const int offset_3d = coord * 3;
             const int offset_2d = coord * 2;
@@ -542,7 +782,8 @@ t8_geometry_cad::t8_geom_evaluate_cad_quad (t8_cmesh_t cmesh, t8_gloidx_t gtreei
                                           temp_coords);
 
             /* Linear interpolation between parameters */
-            t8_geom_linear_interpolation (&ref_coords[edge_direction + offset_2d], parameters, 2, 1, temp_parameters);
+            t8_geom_linear_interpolation (&ref_coords[edge_direction + offset_2d], unwrapped_parameters, 2, 1,
+                                          temp_parameters);
             /* Calculate point on sirface with interpolated parameters. */
             surface->D0 (temp_parameters[0 + offset_2d], temp_parameters[1 + offset_2d], pnt);
 
@@ -622,6 +863,20 @@ t8_geometry_cad::t8_geom_evaluate_cad_tet (t8_cmesh_t cmesh, t8_gloidx_t gtreeid
           cmesh, t8_get_package_id (), T8_CMESH_CAD_EDGE_PARAMETERS_ATTRIBUTE_KEY + i_edge, ltreeid);
         T8_ASSERT (parameters != NULL);
 
+        /* Unwrap the periodic-seam parameters of the linked curve/surface so
+         * the interpolation below follows the short arc. No-op for the
+         * non-periodic case. */
+        double unwrapped_parameters[4];
+        if (active_edges()[i_edge] > 0) {
+          t8_geom_cad_unwrap_periodic_curve_parameters (
+            cad_manager->t8_geom_get_cad_curve (active_edges()[i_edge]), parameters, unwrapped_parameters);
+        }
+        else {
+          t8_geom_cad_unwrap_periodic_surface_parameters (
+            cad_manager->t8_geom_get_cad_surface (active_edges()[i_edge + num_edges]), 2, parameters,
+            unwrapped_parameters);
+        }
+
         /* Interpolate between the parameters of the current edge. Same procedure as above.
         * Curves have only one parameter u, surfaces have two, u and v.
         * Therefore, we have to distinguish if the edge has a curve or surface linked to it. */
@@ -629,14 +884,14 @@ t8_geometry_cad::t8_geom_evaluate_cad_tet (t8_cmesh_t cmesh, t8_gloidx_t gtreeid
         if (active_edges()[i_edge] > 0) { /* Check for linked curves */
 
           /* Linear interpolation between parameters */
-          t8_geom_linear_interpolation (&interpolation_coeff, parameters, 1, 1, &interpolated_curve_param);
+          t8_geom_linear_interpolation (&interpolation_coeff, unwrapped_parameters, 1, 1, &interpolated_curve_param);
 
           pnt = process_curve (active_edges()[i_edge], interpolated_curve_param);
         }
         else { /* Check for linked surfaces */
 
           /* Linear interpolation between parameters */
-          t8_geom_linear_interpolation (&interpolation_coeff, parameters, 2, 1, interpolated_surface_params);
+          t8_geom_linear_interpolation (&interpolation_coeff, unwrapped_parameters, 2, 1, interpolated_surface_params);
 
           pnt = process_surface (active_edges()[i_edge + num_edges], interpolated_surface_params);
         }
@@ -714,11 +969,19 @@ t8_geometry_cad::t8_geom_evaluate_cad_tet (t8_cmesh_t cmesh, t8_gloidx_t gtreeid
               cmesh, t8_get_package_id (), T8_CMESH_CAD_EDGE_PARAMETERS_ATTRIBUTE_KEY + i_tree_edge, ltreeid);
             T8_ASSERT (curve_parameters != NULL);
 
+            /* Unwrap the periodic-seam curve parameter pair so the
+             * interpolation follows the short arc (no-op for non-periodic). */
+            double unwrapped_curve_parameters[2];
+            t8_geom_cad_unwrap_periodic_curve_parameters (
+              cad_manager->t8_geom_get_cad_curve (active_edges()[i_tree_edge]), curve_parameters,
+              unwrapped_curve_parameters);
+
             /* Get the interpolation coefficients for the current edge */
             const double *interpolation_coeff = &face_intersection[t8_interpolation_coefficient_tet_edge[i_tree_edge]];
 
             /* Interpolate linearly between the parameters of the two nodes on the curve */
-            t8_geom_linear_interpolation (interpolation_coeff, curve_parameters, 1, 1, &interpolated_curve_param);
+            t8_geom_linear_interpolation (interpolation_coeff, unwrapped_curve_parameters, 1, 1,
+                                          &interpolated_curve_param);
 
             /* Do the same interpolation but this time between the coordinates of the same two nodes as above */
             double interpolated_edge_coordinates[3];
@@ -842,11 +1105,25 @@ t8_geometry_cad::t8_geom_evaluate_cad_hex (t8_cmesh_t cmesh, t8_gloidx_t gtreeid
           cmesh, t8_get_package_id (), T8_CMESH_CAD_EDGE_PARAMETERS_ATTRIBUTE_KEY + i_edge, ltreeid);
         T8_ASSERT (parameters != NULL);
 
+        /* Unwrap the periodic-seam parameters of the linked curve/surface so
+         * the interpolation below follows the short arc. No-op for the
+         * non-periodic case. */
+        double unwrapped_parameters[4];
+        if (active_edges()[i_edge] > 0) {
+          t8_geom_cad_unwrap_periodic_curve_parameters (
+            cad_manager->t8_geom_get_cad_curve (active_edges()[i_edge]), parameters, unwrapped_parameters);
+        }
+        else {
+          t8_geom_cad_unwrap_periodic_surface_parameters (
+            cad_manager->t8_geom_get_cad_surface (active_edges()[i_edge + num_edges]), 2, parameters,
+            unwrapped_parameters);
+        }
+
         /* Curves have only one parameter u, surfaces have two, u and v.
         * Therefore, we have to distinguish if the edge has a curve or surface linked to it. */
         if (active_edges()[i_edge] > 0) {
           /* Linear interpolation between parameters */
-          t8_geom_linear_interpolation (&ref_coords[edge_direction + offset_3d], parameters, 1, 1,
+          t8_geom_linear_interpolation (&ref_coords[edge_direction + offset_3d], unwrapped_parameters, 1, 1,
                                         &interpolated_curve_param);
 
           pnt = process_curve (active_edges()[i_edge], interpolated_curve_param);
@@ -854,7 +1131,7 @@ t8_geometry_cad::t8_geom_evaluate_cad_hex (t8_cmesh_t cmesh, t8_gloidx_t gtreeid
         else {
           T8_ASSERT (active_edges()[i_edge + num_edges] > 0);
           /* Linear interpolation between parameters */
-          t8_geom_linear_interpolation (&ref_coords[edge_direction + offset_3d], parameters, 2, 1,
+          t8_geom_linear_interpolation (&ref_coords[edge_direction + offset_3d], unwrapped_parameters, 2, 1,
                                         interpolated_surface_params);
 
           pnt = process_surface (active_edges()[i_edge + num_edges], interpolated_surface_params);
@@ -948,8 +1225,16 @@ t8_geometry_cad::t8_geom_evaluate_cad_hex (t8_cmesh_t cmesh, t8_gloidx_t gtreeid
                                                    ltreeid);
             T8_ASSERT (curve_parameters != NULL);
 
+            /* Unwrap the periodic-seam curve parameter pair so the
+             * interpolation follows the short arc (no-op for non-periodic). */
+            double unwrapped_curve_parameters[2];
+            t8_geom_cad_unwrap_periodic_curve_parameters (
+              cad_manager->t8_geom_get_cad_curve (
+                active_edges()[t8_face_edge_to_tree_edge[T8_ECLASS_HEX][i_faces][i_face_edge]]),
+              curve_parameters, unwrapped_curve_parameters);
+
             /* Interpolate linearly between the parameters of the two nodes on the curve */
-            t8_geom_linear_interpolation (&ref_coords[edge_direction + offset_3d], curve_parameters, 1, 1,
+            t8_geom_linear_interpolation (&ref_coords[edge_direction + offset_3d], unwrapped_curve_parameters, 1, 1,
                                           &interpolated_curve_param);
             /* Do the same interpolation but with the surface parameters of the same two nodes as above */
             double interpolated_surface_parameters_on_edge[2];
@@ -1138,19 +1423,33 @@ t8_geometry_cad::t8_geom_evaluate_cad_prism (t8_cmesh_t cmesh, t8_gloidx_t gtree
           cmesh, t8_get_package_id (), T8_CMESH_CAD_EDGE_PARAMETERS_ATTRIBUTE_KEY + i_edge, ltreeid);
         T8_ASSERT (parameters != NULL);
 
+        /* Unwrap the periodic-seam parameters of the linked curve/surface so
+         * the interpolation below follows the short arc. No-op for the
+         * non-periodic case. */
+        double unwrapped_parameters[4];
+        if (active_edges()[i_edge] > 0) {
+          t8_geom_cad_unwrap_periodic_curve_parameters (
+            cad_manager->t8_geom_get_cad_curve (active_edges()[i_edge]), parameters, unwrapped_parameters);
+        }
+        else {
+          t8_geom_cad_unwrap_periodic_surface_parameters (
+            cad_manager->t8_geom_get_cad_surface (active_edges()[i_edge + T8_DPRISM_EDGES]), 2, parameters,
+            unwrapped_parameters);
+        }
+
         /* Curves have only one parameter u, surfaces have two, u and v.
         * Therefore, we have to distinguish if the edge has a curve or surface linked to it. */
         if (active_edges()[i_edge] > 0) {
           /* Linear interpolation between parameters */
           t8_geom_linear_interpolation (&ref_coords[t8_interpolation_coefficient_prism_edge[i_edge] + offset_3d],
-                                        parameters, 1, 1, &interpolated_curve_param);
+                                        unwrapped_parameters, 1, 1, &interpolated_curve_param);
 
           pnt = process_curve (active_edges()[i_edge], interpolated_curve_param);
         }
         else {
           /* Linear interpolation between parameters */
           t8_geom_linear_interpolation (&ref_coords[t8_interpolation_coefficient_prism_edge[i_edge] + offset_3d],
-                                        parameters, 2, 1, interpolated_surface_params);
+                                        unwrapped_parameters, 2, 1, interpolated_surface_params);
 
           pnt = process_surface (active_edges()[i_edge + T8_DPRISM_EDGES], interpolated_surface_params);
         }
@@ -1209,8 +1508,15 @@ t8_geometry_cad::t8_geom_evaluate_cad_prism (t8_cmesh_t cmesh, t8_gloidx_t gtree
               cmesh, t8_get_package_id (), T8_CMESH_CAD_EDGE_PARAMETERS_ATTRIBUTE_KEY + i_tree_edge, ltreeid);
             T8_ASSERT (curve_parameters != NULL);
 
+            /* Unwrap the periodic-seam curve parameter pair so the
+             * interpolation follows the short arc (no-op for non-periodic). */
+            double unwrapped_curve_parameters[2];
+            t8_geom_cad_unwrap_periodic_curve_parameters (
+              cad_manager->t8_geom_get_cad_curve (active_edges()[i_tree_edge]), curve_parameters,
+              unwrapped_curve_parameters);
+
             /* Interpolate linearly between the parameters of the two nodes on the curve */
-            t8_geom_linear_interpolation (&ref_coords[interpolation_coeff + offset_3d], curve_parameters, 1, 1,
+            t8_geom_linear_interpolation (&ref_coords[interpolation_coeff + offset_3d], unwrapped_curve_parameters, 1, 1,
                                           &interpolated_curve_param);
 
             /* Do the same interpolation but this time between the coordinates of the same two nodes as above */
@@ -1300,8 +1606,12 @@ t8_geometry_cad::process_curve (const int curve_index, const double param) const
   /* Check if curve is valid */
   T8_ASSERT (!curve.IsNull ());
 
+  /* Fold a seam-unwrapped parameter back into the curve's range (no-op unless
+   * the parameter was unwrapped across a closed curve's seam). */
+  const double eval_param = t8_geom_cad_reduce_closed_curve_param (curve, param);
+
   /* Calculate point on curve with interpolated parameters */
-  curve->D0 (param, pnt);
+  curve->D0 (eval_param, pnt);
 
   return pnt;
 }
