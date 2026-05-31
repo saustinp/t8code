@@ -91,7 +91,17 @@ class BalancePeriodicEdge : public ::testing::Test {
       FAIL () << "Failed to get MPI size";
     }
     if (mpi_size > 1) {
-      GTEST_SKIP () << "Path C v2 is single-rank only at this layer; multi-rank is a follow-up.";
+      /* t8_forest_new_uniform on MPI_COMM_WORLD SFC-partitions the leaves
+       * even when the cmesh is replicated. The periodic cache requires a
+       * REPLICATED FOREST (every rank holds the full leaf set) for the
+       * per-rank corner hash to be globally complete. To exercise the
+       * replicated NP>1 code path correctly, the gtest would need to
+       * build the forest on MPI_COMM_SELF — that's a separate test, not
+       * a v2-balance gate. Keep the skip here; the replicated MVP is
+       * gated by amr_dev integration tests 88/86/87 instead. */
+      GTEST_SKIP () << "Replicated NP>1 forests require MPI_COMM_SELF; this "
+                       "gtest uses MPI_COMM_WORLD which SFC-partitions. "
+                       "Distributed-multi-rank Path C is a future follow-up.";
     }
     scheme = t8_scheme_new_default ();
     /* 3D periodic Kuhn cube: 6 tets at the cmesh level, full x+y+z periodicity. */
@@ -187,6 +197,110 @@ TEST_F (BalancePeriodicEdge, post_balance_periodic_2to1_holds)
 /* Post-balance face check (existing balance contract): every leaf is
  * face-balanced. v2 must not regress this. */
 TEST_F (BalancePeriodicEdge, post_balance_face_2to1_holds)
+{
+  EXPECT_TRUE (t8_forest_is_balanced (forest)) << "Forest reports not-balanced after t8_forest_balance.";
+}
+
+/* ------------------------------------------------------------------ */
+/* Replicated multi-rank gate (R1, 2026-05-31):                       */
+/*                                                                    */
+/* Builds the forest on MPI_COMM_SELF so every rank holds the full    */
+/* leaf set (replicated forest). At NP=1 this matches BalancePeriodic */
+/* Edge exactly. At NP>1 it exercises the R1 code path in             */
+/* t8_forest_periodic_cache_new where the (forest->mpisize > 1 &&     */
+/* local_num != global_num) short-circuit no longer fires because     */
+/* local_num == global_num.                                           */
+/* ------------------------------------------------------------------ */
+class BalancePeriodicEdgeReplicated : public ::testing::Test {
+ protected:
+  void
+  SetUp () override
+  {
+    scheme = t8_scheme_new_default ();
+    /* COMM_SELF: each rank builds its own private replicated cmesh +
+     * forest. No cross-rank dependence in setup. */
+    t8_cmesh_t cmesh = t8_cmesh_new_hypercube (T8_ECLASS_TET, sc_MPI_COMM_SELF,
+                                               /*do_bcast=*/0, /*do_partition=*/0,
+                                               /*periodic=*/1);
+    ASSERT_NE (cmesh, nullptr);
+    t8_forest_t uniform_forest
+      = t8_forest_new_uniform (cmesh, scheme, /*level=*/1, /*do_face_ghost=*/1, sc_MPI_COMM_SELF);
+    ASSERT_NE (uniform_forest, nullptr);
+
+    t8_forest_t adapted_forest;
+    t8_forest_init (&adapted_forest);
+    t8_forest_set_adapt (adapted_forest, uniform_forest, adapt_refine_tree0_to_level3, /*recursive=*/1);
+    t8_forest_set_ghost (adapted_forest, 1, T8_GHOST_FACES);
+    t8_forest_commit (adapted_forest);
+
+    t8_forest_t balanced_forest;
+    t8_forest_init (&balanced_forest);
+    t8_forest_set_balance (balanced_forest, adapted_forest, /*no_repartition=*/1);
+    t8_forest_set_ghost (balanced_forest, 1, T8_GHOST_FACES);
+    t8_forest_commit (balanced_forest);
+
+    forest = balanced_forest;
+    ASSERT_NE (forest, nullptr);
+  }
+
+  void
+  TearDown () override
+  {
+    if (forest != nullptr) {
+      t8_forest_unref (&forest);
+    }
+  }
+
+  const t8_scheme *scheme = nullptr;
+  t8_forest_t forest = nullptr;
+};
+
+TEST_F (BalancePeriodicEdgeReplicated, post_balance_periodic_2to1_holds)
+{
+  const t8_scheme *fscheme = t8_forest_get_scheme (forest);
+  const t8_locidx_t n_trees = t8_forest_get_num_local_trees (forest);
+  ASSERT_GT (n_trees, 0);
+
+  int violations = 0;
+  int n_checked = 0;
+  int n_pairs = 0;
+
+  for (t8_locidx_t lt = 0; lt < n_trees; ++lt) {
+    const t8_eclass_t lt_class = t8_forest_get_tree_class (forest, lt);
+    const t8_locidx_t n_leaves = t8_forest_get_tree_num_leaf_elements (forest, lt);
+    for (t8_locidx_t le = 0; le < n_leaves; ++le) {
+      const t8_element_t *leaf = t8_forest_get_leaf_element_in_tree (forest, lt, le);
+      const int my_level = fscheme->element_get_level (lt_class, leaf);
+
+      t8_periodic_incidence_t *inc = nullptr;
+      int n_inc = 0;
+      t8_forest_leaf_periodic_neighbors (forest, lt, leaf, &inc, &n_inc, /*forest_is_balanced=*/1);
+
+      for (int i = 0; i < n_inc; ++i) {
+        const t8_eclass_t neigh_class = inc[i].neighbor_eclass;
+        const int neigh_level = fscheme->element_get_level (neigh_class, inc[i].neighbor_leaf);
+        const int diff = std::abs (my_level - neigh_level);
+        if (diff > 1) {
+          if (violations < 8) {
+            ADD_FAILURE () << "Periodic-adjacency 2:1 violated (replicated): leaf (tree=" << lt << ", leid=" << le
+                           << ", level=" << my_level << ") vs periodic partner at level " << neigh_level
+                           << " (incidence type=" << (int) inc[i].incidence_type << ")";
+          }
+          ++violations;
+        }
+        ++n_pairs;
+      }
+      free_incidences (inc, n_inc, fscheme);
+      ++n_checked;
+    }
+  }
+
+  EXPECT_GT (n_pairs, 0) << "Test setup is degenerate: no periodic incidences found at all.";
+  EXPECT_EQ (violations, 0) << "Found " << violations << " periodic-adjacency 2:1 violations across "
+                            << n_pairs << " pairs (checked " << n_checked << " leaves).";
+}
+
+TEST_F (BalancePeriodicEdgeReplicated, post_balance_face_2to1_holds)
 {
   EXPECT_TRUE (t8_forest_is_balanced (forest)) << "Forest reports not-balanced after t8_forest_balance.";
 }

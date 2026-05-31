@@ -1945,9 +1945,19 @@ t8_forest_leaf_periodic_neighbors (t8_forest_t forest, t8_locidx_t ltreeid, cons
 {
   T8_ASSERT (t8_forest_is_committed (forest));
   T8_ASSERT (t8_forest_element_is_leaf (forest, leaf, ltreeid));
-  SC_CHECK_ABORT (forest->mpisize == 1,
-                  "t8_forest_leaf_periodic_neighbors: multi-rank support is a follow-up; "
-                  "single-rank only in this version.\n");
+  /* Replicated NP>1 forests are supported: every rank holds the full leaf
+   * set, so the per-rank corner walk sees every potential partner. Only
+   * truly distributed forests (local_num != global_num) are deferred. */
+  if (forest->mpisize > 1) {
+    const t8_gloidx_t global_num
+      = t8_forest_get_global_num_leaf_elements (forest);
+    const t8_locidx_t local_num
+      = t8_forest_get_local_num_leaf_elements (forest);
+    SC_CHECK_ABORT (static_cast<t8_gloidx_t> (local_num) == global_num,
+                    "t8_forest_leaf_periodic_neighbors: distributed multi-rank "
+                    "support is a follow-up; replicated forests at NP>1 are "
+                    "supported but partitioned forests are not.\n");
+  }
   SC_CHECK_ABORT (forest_is_balanced,
                   "t8_forest_leaf_periodic_neighbors: forest must be 2:1 balanced.\n");
 
@@ -2298,11 +2308,27 @@ t8_forest_periodic_cache_new (t8_forest_t forest)
 {
   T8_ASSERT (t8_forest_is_committed (forest));
 
-  /* Path C v2: multi-rank support is a follow-up. Return NULL on multi-rank so
-   * callers (t8_forest_balance) silently skip the periodic 2:1 check rather
-   * than abort — non-periodic multi-rank balance must still work. */
+  /* Path C v2: distributed multi-rank support is a follow-up. For REPLICATED
+   * forests at mpisize>1 (every rank holds the full leaf set), the cache works
+   * as-is: each rank's local corner hash IS the global hash since the leaves
+   * are replicated. For PARTITIONED (distributed) forests we return NULL so
+   * balance silently falls back to face-only — adding cross-rank Allgatherv on
+   * on-seam corners is tracked under B2 in the frozen distributed plan
+   * (notes/PLAN_DISTRIBUTED_MULTIRANK_FROZEN_2026_05_31.md in amr_dev).
+   *
+   * Replicated detection: a forest is replicated iff every rank's local leaf
+   * count equals the global leaf count. This is the load-bearing predicate
+   * (not t8_cmesh_is_partitioned alone — a replicated cmesh can still feed a
+   * distributed forest if comm size > 1 in t8_forest_new_uniform). */
   if (forest->mpisize > 1) {
-    return nullptr;
+    const t8_gloidx_t global_num
+      = t8_forest_get_global_num_leaf_elements (forest);
+    const t8_locidx_t local_num
+      = t8_forest_get_local_num_leaf_elements (forest);
+    if (static_cast<t8_gloidx_t> (local_num) != global_num) {
+      /* Distributed forest — deferred. */
+      return nullptr;
+    }
   }
 
   const double tol = 10.0 * T8_PRECISION_EPS;
