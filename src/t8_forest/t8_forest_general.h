@@ -690,6 +690,77 @@ int
 t8_forest_leaf_face_neighbors_count (t8_forest_t forest, t8_locidx_t ltreeid, const t8_element_t *leaf, int face);
 
 
+/** Topological-incidence type returned by \ref t8_forest_leaf_periodic_neighbors. */
+typedef enum {
+  T8_PERIODIC_INCIDENCE_FACE   = 0, /**< Neighbor shares a full face with the leaf via periodicity. */
+  T8_PERIODIC_INCIDENCE_EDGE   = 1, /**< Neighbor shares only an edge with the leaf via periodicity. */
+  T8_PERIODIC_INCIDENCE_VERTEX = 2  /**< Neighbor shares only a vertex with the leaf via periodicity. */
+} t8_periodic_incidence_type_t;
+
+/** One periodic incidence between a leaf and a neighbor leaf reached through one or
+ * more periodic boundary joins. Returned in arrays by \ref t8_forest_leaf_periodic_neighbors. */
+typedef struct t8_periodic_incidence
+{
+  t8_element_t                *neighbor_leaf;       /**< The neighbor leaf (callee-owned, see destroy contract). */
+  t8_locidx_t                  neighbor_local_idx;  /**< Local idx 0..num_local_el-1, or ghost idx num_local_el..+num_ghosts-1. */
+  t8_locidx_t                  neighbor_ltreeid;    /**< Local tree id of the neighbor's tree. */
+  t8_eclass_t                  neighbor_eclass;     /**< Element class of the neighbor. */
+  t8_periodic_incidence_type_t incidence_type;      /**< Face, edge, or vertex shared via periodicity. */
+  int                          leaf_entity;         /**< Index of the face/edge/vertex on the source leaf. */
+  int                          neighbor_entity;     /**< Index of the corresponding entity on the neighbor leaf. */
+} t8_periodic_incidence_t;
+
+/** Find all leaves topologically incident to a given leaf via periodic boundary joins.
+ *
+ * Companion to \ref t8_forest_leaf_face_neighbors. The standard face-neighbor query
+ * walks the per-face cmesh joins, so it only sees neighbors that share an entire FACE
+ * (across a single periodic join, or normal interior face). On a periodic cube
+ * decomposed into tetrahedra (or any tet mesh with non-grid-aligned periodic faces)
+ * two leaves may share only an EDGE or a VERTEX through periodicity — e.g. a leaf
+ * with an edge lying on a periodic seam can have an edge-only periodic mirror
+ * partner that the face-based query misses.
+ *
+ * This query returns the union of all such incidences (face, edge, and vertex —
+ * each annotated with its type). For each match, the returned struct records
+ * which entity on the source leaf is incident to which entity on the neighbor.
+ *
+ * The query is JUST-IN-TIME: it derives the periodic adjacency from the cmesh's
+ * face-pair joins (\ref t8_cmesh_set_join) on every call. No precomputed cmesh
+ * table is required.
+ *
+ * Allocation contract: callee allocates \a *pincidences via T8_ALLOC and the
+ * neighbor_leaf members via the leaf scheme. The caller must:
+ *   if (num_incidences > 0) {
+ *     for (int i = 0; i < num_incidences; ++i) {
+ *       const t8_eclass_t neigh_class = (*pincidences)[i].neighbor_eclass;
+ *       scheme->element_destroy (neigh_class, 1, &(*pincidences)[i].neighbor_leaf);
+ *     }
+ *     T8_FREE (*pincidences);
+ *   }
+ *
+ * \param[in]  forest               A committed, balanced forest. Must have a ghost
+ *                                  layer when forest->mpisize > 1.
+ * \param[in]  ltreeid              Local tree id of \a leaf.
+ * \param[in]  leaf                 A leaf of local tree \a ltreeid.
+ * \param[out] pincidences          Unallocated on input; allocated array of
+ *                                  t8_periodic_incidence_t on output.
+ * \param[out] num_incidences       Number of periodic incidences found.
+ * \param[in]  forest_is_balanced   True if we know \a forest is balanced.
+ *
+ * \note If \a leaf has no periodic incidences (no edge/vertex/face of it lies on a
+ *       periodic seam), *pincidences = NULL and *num_incidences = 0 on output.
+ * \note Face-shared periodic incidences are returned in addition to (not instead
+ *       of) what t8_forest_leaf_face_neighbors would yield for the same face,
+ *       to give callers a uniform view of periodic adjacency.
+ * \note Currently the implementation is single-rank only (mpisize == 1). The
+ *       function asserts on mpisize > 1; multi-rank support is a follow-up.
+ */
+void
+t8_forest_leaf_periodic_neighbors (t8_forest_t forest, t8_locidx_t ltreeid, const t8_element_t *leaf,
+                                   t8_periodic_incidence_t **pincidences, int *num_incidences,
+                                   int forest_is_balanced);
+
+
 /** Like \ref t8_forest_leaf_face_neighbors but also provides information about the global neighbors and the orientation.
  * \param [in]    forest  The forest. Must have a valid ghost layer.
  * \param [in]    ltreeid A local tree id.

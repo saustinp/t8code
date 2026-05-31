@@ -25,6 +25,11 @@
  */
 
 #include <sc_statistics.h>
+#include <cmath>
+#include <functional>
+#include <map>
+#include <unordered_map>
+#include <vector>
 #include <t8_helper_functions/t8_refcount.h>
 #include <t8_types/t8_vec.h>
 #include <t8_forest/t8_forest_general.h>
@@ -1883,6 +1888,350 @@ t8_forest_leaf_face_neighbors (t8_forest_t forest, t8_locidx_t ltreeid, const t8
 {
   t8_forest_leaf_face_neighbors_ext (forest, ltreeid, leaf, pneighbor_leaves, face, dual_faces, num_neighbors,
                                      pelement_indices, pneigh_eclass, forest_is_balanced, NULL, NULL);
+}
+
+/* Helper: number of vertices on face \a face of element class \a eclass. */
+static int
+t8_forest_periodic_num_face_vertices (t8_eclass_t eclass, int face)
+{
+  /* Per-face vertex count (some eclasses have mixed face shapes; pyramid is the
+   * notable example). t8 does not expose this as a table, so we hardcode it
+   * here for the eclasses Path C supports. */
+  switch (eclass) {
+  case T8_ECLASS_TRIANGLE:
+    return 2;
+  case T8_ECLASS_QUAD:
+    return 2;
+  case T8_ECLASS_TET:
+    return 3;
+  case T8_ECLASS_HEX:
+    return 4;
+  case T8_ECLASS_PRISM:
+    /* faces 0,1,2 are quads; faces 3,4 are tris */
+    return (face <= 2) ? 4 : 3;
+  case T8_ECLASS_PYRAMID:
+    /* faces 0..3 are tris; face 4 is a quad */
+    return (face <= 3) ? 3 : 4;
+  default:
+    SC_ABORTF ("t8_forest_periodic_num_face_vertices: unsupported eclass %d\n", eclass);
+    return -1;
+  }
+}
+
+/* Helper: compute the centroid of cmesh face \a face on cmesh tree \a tree (in
+ * physical space). Writes result to \a centroid[3]. */
+static void
+t8_forest_periodic_face_centroid (t8_cmesh_t cmesh, t8_locidx_t tree, int face, double centroid[3])
+{
+  const t8_eclass_t tree_eclass = t8_cmesh_get_tree_class (cmesh, tree);
+  const int n_face_verts = t8_forest_periodic_num_face_vertices (tree_eclass, face);
+  const double *tree_verts = t8_cmesh_get_tree_vertices (cmesh, tree);
+  centroid[0] = centroid[1] = centroid[2] = 0.0;
+  for (int fv = 0; fv < n_face_verts; ++fv) {
+    const int tv = t8_face_vertex_to_tree_vertex[tree_eclass][face][fv];
+    centroid[0] += tree_verts[tv * 3 + 0];
+    centroid[1] += tree_verts[tv * 3 + 1];
+    centroid[2] += tree_verts[tv * 3 + 2];
+  }
+  centroid[0] /= n_face_verts;
+  centroid[1] /= n_face_verts;
+  centroid[2] /= n_face_verts;
+}
+
+void
+t8_forest_leaf_periodic_neighbors (t8_forest_t forest, t8_locidx_t ltreeid, const t8_element_t *leaf,
+                                   t8_periodic_incidence_t **pincidences, int *num_incidences,
+                                   int forest_is_balanced)
+{
+  T8_ASSERT (t8_forest_is_committed (forest));
+  T8_ASSERT (t8_forest_element_is_leaf (forest, leaf, ltreeid));
+  SC_CHECK_ABORT (forest->mpisize == 1,
+                  "t8_forest_leaf_periodic_neighbors: multi-rank support is a follow-up; "
+                  "single-rank only in this version.\n");
+  SC_CHECK_ABORT (forest_is_balanced,
+                  "t8_forest_leaf_periodic_neighbors: forest must be 2:1 balanced.\n");
+
+  *pincidences = NULL;
+  *num_incidences = 0;
+
+  const double tol = 10.0 * T8_PRECISION_EPS;
+  const t8_cmesh_t cmesh = t8_forest_get_cmesh (forest);
+  const t8_scheme *scheme = t8_forest_get_scheme (forest);
+  const t8_eclass_t leaf_eclass = t8_forest_get_tree_class (forest, ltreeid);
+  const int n_leaf_corners = scheme->element_get_num_corners (leaf_eclass, leaf);
+  T8_ASSERT (n_leaf_corners <= T8_ECLASS_MAX_CORNERS);
+
+  /* --- 1. Source leaf corner positions in physical space. --- */
+  double src_corners[T8_ECLASS_MAX_CORNERS][3];
+  for (int c = 0; c < n_leaf_corners; ++c) {
+    t8_forest_element_coordinate (forest, ltreeid, leaf, c, src_corners[c]);
+  }
+
+  /* --- 2. Derive unique periodic translations from cmesh face-pair joins. ---
+   * Walk all (tree, face) of the cmesh; for each face-pair join whose two
+   * face centroids differ by more than `tol` (in physical space), the
+   * difference is a periodic translation. Deduplicate. */
+  const int MAX_TRANSLATIONS = 64;
+  double translations[MAX_TRANSLATIONS][3];
+  int n_translations = 0;
+
+  const t8_locidx_t n_local_trees = t8_cmesh_get_num_local_trees (cmesh);
+  for (t8_locidx_t tree = 0; tree < n_local_trees; ++tree) {
+    const t8_eclass_t tree_eclass = t8_cmesh_get_tree_class (cmesh, tree);
+    const int n_faces = t8_eclass_num_faces[tree_eclass];
+    for (int face = 0; face < n_faces; ++face) {
+      int dual_face, orient;
+      const t8_locidx_t neigh_tree = t8_cmesh_get_face_neighbor (cmesh, tree, face, &dual_face, &orient);
+      if (neigh_tree < 0) continue; /* genuine boundary, no join */
+
+      double src_centroid[3], neigh_centroid[3];
+      t8_forest_periodic_face_centroid (cmesh, tree, face, src_centroid);
+      t8_forest_periodic_face_centroid (cmesh, neigh_tree, dual_face, neigh_centroid);
+      const double dx = neigh_centroid[0] - src_centroid[0];
+      const double dy = neigh_centroid[1] - src_centroid[1];
+      const double dz = neigh_centroid[2] - src_centroid[2];
+      const double tnorm2 = dx * dx + dy * dy + dz * dz;
+      if (tnorm2 < tol * tol) continue; /* interior tree-tree boundary, not periodic */
+
+      /* Deduplicate: skip if (dx,dy,dz) already in the translation list. */
+      int dup = 0;
+      for (int t = 0; t < n_translations; ++t) {
+        const double ddx = dx - translations[t][0];
+        const double ddy = dy - translations[t][1];
+        const double ddz = dz - translations[t][2];
+        if (ddx * ddx + ddy * ddy + ddz * ddz < tol * tol) {
+          dup = 1;
+          break;
+        }
+      }
+      if (dup) continue;
+
+      if (n_translations >= MAX_TRANSLATIONS) {
+        SC_ABORTF ("t8_forest_leaf_periodic_neighbors: too many unique periodic "
+                   "translations (>%d). Raise MAX_TRANSLATIONS in t8_forest.cxx.\n",
+                   MAX_TRANSLATIONS);
+      }
+      translations[n_translations][0] = dx;
+      translations[n_translations][1] = dy;
+      translations[n_translations][2] = dz;
+      ++n_translations;
+    }
+  }
+
+  if (n_translations == 0) {
+    return; /* not a periodic mesh — no incidences possible. */
+  }
+
+  /* --- 3a. Build a spatial hash of all leaf corners. Path C performance
+   *         requires this — naive O(N_leaves^2) per pre-pass call is fatal
+   *         on production-scale meshes (test 88 S4: 115K leaves → 13 * 10^9
+   *         ops per call). The hash maps a quantized (x,y,z) bucket to the
+   *         list of (ltreeid, leid, corner) tuples whose physical position
+   *         falls in that bucket. Lookups are then O(1) per source corner
+   *         per translation. --- */
+  struct CornerKey {
+    int64_t qx, qy, qz;
+    bool operator== (const CornerKey &o) const { return qx == o.qx && qy == o.qy && qz == o.qz; }
+  };
+  struct CornerKeyHash {
+    size_t operator() (const CornerKey &k) const noexcept
+    {
+      size_t h = 0;
+      h ^= std::hash<int64_t> {}(k.qx) + 0x9e3779b9 + (h << 6) + (h >> 2);
+      h ^= std::hash<int64_t> {}(k.qy) + 0x9e3779b9 + (h << 6) + (h >> 2);
+      h ^= std::hash<int64_t> {}(k.qz) + 0x9e3779b9 + (h << 6) + (h >> 2);
+      return h;
+    }
+  };
+  struct CornerLoc {
+    t8_locidx_t ltreeid;
+    t8_locidx_t leid;
+    int corner;
+  };
+  const double bucket = std::max (tol * 4.0, 1e-9);
+  auto quantize = [&] (const double xyz[3]) {
+    CornerKey k;
+    k.qx = (int64_t) std::floor (xyz[0] / bucket + 0.5);
+    k.qy = (int64_t) std::floor (xyz[1] / bucket + 0.5);
+    k.qz = (int64_t) std::floor (xyz[2] / bucket + 0.5);
+    return k;
+  };
+  std::unordered_map<CornerKey, std::vector<CornerLoc>, CornerKeyHash> corner_hash;
+  corner_hash.reserve (1024);
+
+  const t8_locidx_t n_forest_trees = t8_forest_get_num_local_trees (forest);
+  for (t8_locidx_t nt = 0; nt < n_forest_trees; ++nt) {
+    const t8_eclass_t neigh_eclass = t8_forest_get_tree_class (forest, nt);
+    const t8_locidx_t n_leaves = t8_forest_get_tree_num_leaf_elements (forest, nt);
+    for (t8_locidx_t leid = 0; leid < n_leaves; ++leid) {
+      const t8_element_t *neigh_leaf = t8_forest_get_leaf_element_in_tree (forest, nt, leid);
+      const int n_neigh_corners = scheme->element_get_num_corners (neigh_eclass, neigh_leaf);
+      for (int c = 0; c < n_neigh_corners; ++c) {
+        double xyz[3];
+        t8_forest_element_coordinate (forest, nt, neigh_leaf, c, xyz);
+        corner_hash[quantize (xyz)].push_back ({nt, leid, c});
+      }
+    }
+  }
+
+  /* --- 3b. For each translation, look up source-corner + translation in the
+   *        hash. Each hit gives a candidate (neigh_ltreeid, neigh_leid,
+   *        corner) — group by leaf and classify the incidence by # of
+   *        matching corners. --- */
+  sc_array_t inc_array;
+  sc_array_init (&inc_array, sizeof (t8_periodic_incidence_t));
+
+  for (int t = 0; t < n_translations; ++t) {
+    const double *T = translations[t];
+    /* For this translation, accumulate per-candidate-leaf correspondences. */
+    std::map<std::pair<t8_locidx_t, t8_locidx_t>, std::vector<std::pair<int, int>>>
+        per_leaf_matches; /* key: (ltreeid, leid). value: vec<(src_corner, neigh_corner)>. */
+    for (int i = 0; i < n_leaf_corners; ++i) {
+      double mirror[3] = { src_corners[i][0] + T[0], src_corners[i][1] + T[1], src_corners[i][2] + T[2] };
+      /* Check the 27 buckets around the mirror position to handle quantization
+       * boundaries. */
+      for (int dz = -1; dz <= 1; ++dz)
+        for (int dy = -1; dy <= 1; ++dy)
+          for (int dx = -1; dx <= 1; ++dx) {
+            const CornerKey k = quantize (mirror);
+            CornerKey kp = k;
+            kp.qx += dx;
+            kp.qy += dy;
+            kp.qz += dz;
+            auto it = corner_hash.find (kp);
+            if (it == corner_hash.end ()) continue;
+            for (const auto &loc : it->second) {
+              /* Skip the source leaf itself. */
+              if (loc.ltreeid == ltreeid) {
+                const t8_element_t *cand = t8_forest_get_leaf_element_in_tree (forest, loc.ltreeid, loc.leid);
+                if (scheme->element_is_equal (t8_forest_get_tree_class (forest, loc.ltreeid), leaf, cand)) continue;
+              }
+              /* Verify the actual coord (hash bucket isn't conclusive). */
+              double cand_xyz[3];
+              const t8_element_t *cand_leaf = t8_forest_get_leaf_element_in_tree (forest, loc.ltreeid, loc.leid);
+              t8_forest_element_coordinate (forest, loc.ltreeid, cand_leaf, loc.corner, cand_xyz);
+              const double ddx = mirror[0] - cand_xyz[0];
+              const double ddy = mirror[1] - cand_xyz[1];
+              const double ddz = mirror[2] - cand_xyz[2];
+              if (ddx * ddx + ddy * ddy + ddz * ddz < tol * tol) {
+                per_leaf_matches[{loc.ltreeid, loc.leid}].emplace_back (i, loc.corner);
+              }
+            }
+          }
+    }
+
+    for (auto &kv : per_leaf_matches) {
+      const t8_locidx_t nt = kv.first.first;
+      const t8_locidx_t leid = kv.first.second;
+      const auto &matches = kv.second;
+      const t8_eclass_t neigh_eclass = t8_forest_get_tree_class (forest, nt);
+      const t8_element_t *neigh_leaf = t8_forest_get_leaf_element_in_tree (forest, nt, leid);
+      const int n_neigh_corners = scheme->element_get_num_corners (neigh_eclass, neigh_leaf);
+
+      /* Deduplicate corner pairs (a corner may appear multiple times if
+       * source and neighbor corners are coincident under different ones). */
+      int n_match = 0;
+      int src_match[T8_ECLASS_MAX_CORNERS];
+      int neigh_match[T8_ECLASS_MAX_CORNERS];
+      bool seen_src[T8_ECLASS_MAX_CORNERS] = { false };
+      for (const auto &mp : matches) {
+        if (seen_src[mp.first]) continue;
+        seen_src[mp.first] = true;
+        src_match[n_match] = mp.first;
+        neigh_match[n_match] = mp.second;
+        ++n_match;
+      }
+      if (n_match == 0) continue;
+
+        /* --- 4. Classify incidence and look up entity indices. --- */
+        t8_periodic_incidence_type_t inc_type;
+        int leaf_entity = -1;
+        int neighbor_entity = -1;
+
+        if (n_match == 1) {
+          inc_type = T8_PERIODIC_INCIDENCE_VERTEX;
+          leaf_entity = src_match[0];
+          neighbor_entity = neigh_match[0];
+        }
+        else if (n_match == 2) {
+          inc_type = T8_PERIODIC_INCIDENCE_EDGE;
+          /* Find the edge on the source leaf whose two endpoints are
+           * {src_match[0], src_match[1]}. */
+          const int n_edges_src = t8_eclass_num_edges[leaf_eclass];
+          for (int e = 0; e < n_edges_src; ++e) {
+            const int v0 = t8_edge_vertex_to_tree_vertex[leaf_eclass][e][0];
+            const int v1 = t8_edge_vertex_to_tree_vertex[leaf_eclass][e][1];
+            if ((v0 == src_match[0] && v1 == src_match[1])
+                || (v0 == src_match[1] && v1 == src_match[0])) {
+              leaf_entity = e;
+              break;
+            }
+          }
+          const int n_edges_neigh = t8_eclass_num_edges[neigh_eclass];
+          for (int e = 0; e < n_edges_neigh; ++e) {
+            const int v0 = t8_edge_vertex_to_tree_vertex[neigh_eclass][e][0];
+            const int v1 = t8_edge_vertex_to_tree_vertex[neigh_eclass][e][1];
+            if ((v0 == neigh_match[0] && v1 == neigh_match[1])
+                || (v0 == neigh_match[1] && v1 == neigh_match[0])) {
+              neighbor_entity = e;
+              break;
+            }
+          }
+        }
+        else if (n_match == 3) {
+          inc_type = T8_PERIODIC_INCIDENCE_FACE;
+          /* For a tet, face f contains corners {0,1,2,3} \ {f}. Find the
+           * unique corner index NOT in src_match — that's the face index. */
+          int present_src[T8_ECLASS_MAX_CORNERS] = { 0 };
+          for (int k = 0; k < 3; ++k) present_src[src_match[k]] = 1;
+          for (int i = 0; i < n_leaf_corners; ++i) {
+            if (!present_src[i]) {
+              leaf_entity = i;
+              break;
+            }
+          }
+          int present_neigh[T8_ECLASS_MAX_CORNERS] = { 0 };
+          for (int k = 0; k < 3; ++k) present_neigh[neigh_match[k]] = 1;
+          for (int i = 0; i < n_neigh_corners; ++i) {
+            if (!present_neigh[i]) {
+              neighbor_entity = i;
+              break;
+            }
+          }
+        }
+        else {
+          /* n_match == 4 (all corners coincide): the neighbor IS a periodic
+           * mirror copy of the source leaf. Emit as a face incidence with
+           * leaf_entity = -1 to signal "whole element". */
+          inc_type = T8_PERIODIC_INCIDENCE_FACE;
+          leaf_entity = -1;
+          neighbor_entity = -1;
+        }
+
+        /* --- 5. Append incidence record. The caller owns and destroys the
+         *        copied neighbor_leaf via scheme->element_destroy. --- */
+        t8_element_t *neigh_copy;
+        scheme->element_new (neigh_eclass, 1, &neigh_copy);
+        scheme->element_copy (neigh_eclass, neigh_leaf, neigh_copy);
+
+        t8_periodic_incidence_t *rec = (t8_periodic_incidence_t *) sc_array_push (&inc_array);
+        rec->neighbor_leaf = neigh_copy;
+        rec->neighbor_local_idx = t8_forest_get_tree_element_offset (forest, nt) + leid;
+        rec->neighbor_ltreeid = nt;
+        rec->neighbor_eclass = neigh_eclass;
+        rec->incidence_type = inc_type;
+        rec->leaf_entity = leaf_entity;
+        rec->neighbor_entity = neighbor_entity;
+    }
+  }
+
+  *num_incidences = (int) inc_array.elem_count;
+  if (*num_incidences > 0) {
+    *pincidences = T8_ALLOC (t8_periodic_incidence_t, *num_incidences);
+    memcpy (*pincidences, inc_array.array,
+            (size_t) (*num_incidences) * sizeof (t8_periodic_incidence_t));
+  }
+  sc_array_reset (&inc_array);
 }
 
 int
