@@ -2234,6 +2234,263 @@ t8_forest_leaf_periodic_neighbors (t8_forest_t forest, t8_locidx_t ltreeid, cons
   sc_array_reset (&inc_array);
 }
 
+/* =====================================================================
+ * Path C v2: periodic-adjacency cache for balance.
+ *
+ * The v1 query t8_forest_leaf_periodic_neighbors above rebuilds the entire
+ * corner spatial hash on every call. That's O(N_leaves) per call, which
+ * is fine for one-off use but quadratic when balance wants per-leaf
+ * lookups during each adapt round. The cache below precomputes the hash
+ * (and the cmesh-derived translation table) once, then answers per-leaf
+ * "max neighbor level" queries in O(corners * translations * matches).
+ *
+ * NOTE: This is currently a private helper consumed by t8_forest_balance.
+ * If/when v1 is refactored to use the same machinery, the per-call
+ * helpers above can collapse into one cache build + one query.
+ * ===================================================================== */
+
+#include <t8_forest/t8_forest_periodic_cache.hxx>
+
+namespace {
+struct PCacheKey
+{
+  int64_t qx, qy, qz;
+  bool
+  operator== (const PCacheKey &o) const noexcept
+  {
+    return qx == o.qx && qy == o.qy && qz == o.qz;
+  }
+};
+struct PCacheKeyHash
+{
+  size_t
+  operator() (const PCacheKey &k) const noexcept
+  {
+    size_t h = 0;
+    h ^= std::hash<int64_t> {}(k.qx) + 0x9e3779b9 + (h << 6) + (h >> 2);
+    h ^= std::hash<int64_t> {}(k.qy) + 0x9e3779b9 + (h << 6) + (h >> 2);
+    h ^= std::hash<int64_t> {}(k.qz) + 0x9e3779b9 + (h << 6) + (h >> 2);
+    return h;
+  }
+};
+struct PCacheLoc
+{
+  t8_locidx_t ltreeid;
+  t8_locidx_t leid;
+  int8_t corner;
+  int8_t level; /* cached so the max-level query doesn't need a re-fetch */
+};
+}  // namespace
+
+/* Opaque struct opened here. */
+struct t8_forest_periodic_cache
+{
+  static constexpr int MAX_TRANSLATIONS = 64;
+  int n_translations;
+  double translations[MAX_TRANSLATIONS][3];
+  std::unordered_map<PCacheKey, std::vector<PCacheLoc>, PCacheKeyHash> corner_hash;
+  double bucket;
+  double tol;
+};
+
+t8_forest_periodic_cache_t *
+t8_forest_periodic_cache_new (t8_forest_t forest)
+{
+  T8_ASSERT (t8_forest_is_committed (forest));
+
+  /* Path C v2: multi-rank support is a follow-up. Return NULL on multi-rank so
+   * callers (t8_forest_balance) silently skip the periodic 2:1 check rather
+   * than abort — non-periodic multi-rank balance must still work. */
+  if (forest->mpisize > 1) {
+    return nullptr;
+  }
+
+  const double tol = 10.0 * T8_PRECISION_EPS;
+  const t8_cmesh_t cmesh = t8_forest_get_cmesh (forest);
+  const t8_scheme *scheme = t8_forest_get_scheme (forest);
+
+  /* --- 1. Derive unique periodic translations from cmesh face-pair joins.
+   *        Identical to v1; if there are none, the forest has no periodicity
+   *        and we return NULL so callers can short-circuit. */
+  double translations[t8_forest_periodic_cache::MAX_TRANSLATIONS][3];
+  int n_translations = 0;
+  const t8_locidx_t n_local_trees_cmesh = t8_cmesh_get_num_local_trees (cmesh);
+  for (t8_locidx_t tree = 0; tree < n_local_trees_cmesh; ++tree) {
+    const t8_eclass_t tree_eclass = t8_cmesh_get_tree_class (cmesh, tree);
+    const int n_faces = t8_eclass_num_faces[tree_eclass];
+    for (int face = 0; face < n_faces; ++face) {
+      int dual_face, orient;
+      const t8_locidx_t neigh_tree = t8_cmesh_get_face_neighbor (cmesh, tree, face, &dual_face, &orient);
+      if (neigh_tree < 0) continue;
+
+      double src_centroid[3], neigh_centroid[3];
+      t8_forest_periodic_face_centroid (cmesh, tree, face, src_centroid);
+      t8_forest_periodic_face_centroid (cmesh, neigh_tree, dual_face, neigh_centroid);
+      const double dx = neigh_centroid[0] - src_centroid[0];
+      const double dy = neigh_centroid[1] - src_centroid[1];
+      const double dz = neigh_centroid[2] - src_centroid[2];
+      const double tnorm2 = dx * dx + dy * dy + dz * dz;
+      if (tnorm2 < tol * tol) continue;
+
+      int dup = 0;
+      for (int t = 0; t < n_translations; ++t) {
+        const double ddx = dx - translations[t][0];
+        const double ddy = dy - translations[t][1];
+        const double ddz = dz - translations[t][2];
+        if (ddx * ddx + ddy * ddy + ddz * ddz < tol * tol) {
+          dup = 1;
+          break;
+        }
+      }
+      if (dup) continue;
+
+      if (n_translations >= t8_forest_periodic_cache::MAX_TRANSLATIONS) {
+        SC_ABORTF ("t8_forest_periodic_cache_new: too many unique periodic "
+                   "translations (>%d). Raise MAX_TRANSLATIONS in t8_forest.cxx.\n",
+                   t8_forest_periodic_cache::MAX_TRANSLATIONS);
+      }
+      translations[n_translations][0] = dx;
+      translations[n_translations][1] = dy;
+      translations[n_translations][2] = dz;
+      ++n_translations;
+    }
+  }
+
+  if (n_translations == 0) {
+    return nullptr; /* mesh is not periodic; caller short-circuits */
+  }
+
+  t8_forest_periodic_cache_t *cache = new t8_forest_periodic_cache;
+  cache->n_translations = n_translations;
+  for (int t = 0; t < n_translations; ++t) {
+    cache->translations[t][0] = translations[t][0];
+    cache->translations[t][1] = translations[t][1];
+    cache->translations[t][2] = translations[t][2];
+  }
+  cache->bucket = std::max (tol * 4.0, 1e-9);
+  cache->tol = tol;
+
+  /* --- 2. Build the corner spatial hash over all leaves. We also cache the
+   *        per-leaf element level so the per-query path doesn't need to
+   *        re-fetch elements + call element_get_level. */
+  auto quantize = [&] (const double xyz[3]) {
+    PCacheKey k;
+    k.qx = (int64_t) std::floor (xyz[0] / cache->bucket + 0.5);
+    k.qy = (int64_t) std::floor (xyz[1] / cache->bucket + 0.5);
+    k.qz = (int64_t) std::floor (xyz[2] / cache->bucket + 0.5);
+    return k;
+  };
+  cache->corner_hash.reserve (1024);
+
+  const t8_locidx_t n_forest_trees = t8_forest_get_num_local_trees (forest);
+  for (t8_locidx_t nt = 0; nt < n_forest_trees; ++nt) {
+    const t8_eclass_t neigh_eclass = t8_forest_get_tree_class (forest, nt);
+    const t8_locidx_t n_leaves = t8_forest_get_tree_num_leaf_elements (forest, nt);
+    for (t8_locidx_t leid = 0; leid < n_leaves; ++leid) {
+      const t8_element_t *neigh_leaf = t8_forest_get_leaf_element_in_tree (forest, nt, leid);
+      const int n_neigh_corners = scheme->element_get_num_corners (neigh_eclass, neigh_leaf);
+      const int level = scheme->element_get_level (neigh_eclass, neigh_leaf);
+      T8_ASSERT (level >= 0 && level <= INT8_MAX);
+      for (int c = 0; c < n_neigh_corners; ++c) {
+        double xyz[3];
+        t8_forest_element_coordinate (forest, nt, neigh_leaf, c, xyz);
+        cache->corner_hash[quantize (xyz)].push_back (
+          PCacheLoc { nt, leid, (int8_t) c, (int8_t) level });
+      }
+    }
+  }
+
+  return cache;
+}
+
+void
+t8_forest_periodic_cache_destroy (t8_forest_periodic_cache_t *cache)
+{
+  if (cache == nullptr) return;
+  delete cache;
+}
+
+int
+t8_forest_periodic_cache_max_neighbor_level (t8_forest_periodic_cache_t *cache, t8_forest_t forest,
+                                             t8_locidx_t ltreeid, const t8_element_t *leaf)
+{
+  T8_ASSERT (cache != nullptr);
+  T8_ASSERT (t8_forest_is_committed (forest));
+  T8_ASSERT (t8_forest_element_is_leaf (forest, leaf, ltreeid));
+
+  const t8_scheme *scheme = t8_forest_get_scheme (forest);
+  const t8_eclass_t leaf_eclass = t8_forest_get_tree_class (forest, ltreeid);
+  const int n_leaf_corners = scheme->element_get_num_corners (leaf_eclass, leaf);
+  T8_ASSERT (n_leaf_corners <= T8_ECLASS_MAX_CORNERS);
+
+  double src_corners[T8_ECLASS_MAX_CORNERS][3];
+  for (int c = 0; c < n_leaf_corners; ++c) {
+    t8_forest_element_coordinate (forest, ltreeid, leaf, c, src_corners[c]);
+  }
+
+  /* For balance we only need the maximum periodic-neighbor level — no need
+   * to materialize element copies or classify incidence type. We also de-dup
+   * candidate leaves by (ltreeid, leid) so a leaf reached via multiple
+   * source corners doesn't get re-examined. */
+  auto quantize = [&] (const double xyz[3]) {
+    PCacheKey k;
+    k.qx = (int64_t) std::floor (xyz[0] / cache->bucket + 0.5);
+    k.qy = (int64_t) std::floor (xyz[1] / cache->bucket + 0.5);
+    k.qz = (int64_t) std::floor (xyz[2] / cache->bucket + 0.5);
+    return k;
+  };
+
+  std::unordered_map<int64_t, int> seen_candidates; /* key = ltreeid<<32|leid → max level */
+  seen_candidates.reserve (16);
+
+  for (int t = 0; t < cache->n_translations; ++t) {
+    const double *T = cache->translations[t];
+    for (int i = 0; i < n_leaf_corners; ++i) {
+      const double mirror[3] = { src_corners[i][0] + T[0], src_corners[i][1] + T[1], src_corners[i][2] + T[2] };
+      const PCacheKey base = quantize (mirror);
+      for (int dz = -1; dz <= 1; ++dz)
+        for (int dy = -1; dy <= 1; ++dy)
+          for (int dx = -1; dx <= 1; ++dx) {
+            PCacheKey kp { base.qx + dx, base.qy + dy, base.qz + dz };
+            auto it = cache->corner_hash.find (kp);
+            if (it == cache->corner_hash.end ()) continue;
+            for (const auto &loc : it->second) {
+              /* Skip the source leaf itself. */
+              if (loc.ltreeid == ltreeid) {
+                const t8_element_t *cand
+                  = t8_forest_get_leaf_element_in_tree (forest, loc.ltreeid, loc.leid);
+                if (scheme->element_is_equal (leaf_eclass, leaf, cand)) continue;
+              }
+              /* Verify the actual coord (hash bucket isn't conclusive). */
+              const t8_element_t *cand_leaf
+                = t8_forest_get_leaf_element_in_tree (forest, loc.ltreeid, loc.leid);
+              double cand_xyz[3];
+              t8_forest_element_coordinate (forest, loc.ltreeid, cand_leaf, loc.corner, cand_xyz);
+              const double ddx = mirror[0] - cand_xyz[0];
+              const double ddy = mirror[1] - cand_xyz[1];
+              const double ddz = mirror[2] - cand_xyz[2];
+              if (ddx * ddx + ddy * ddy + ddz * ddz < cache->tol * cache->tol) {
+                const int64_t key = ((int64_t) loc.ltreeid << 32) | (uint32_t) loc.leid;
+                auto sit = seen_candidates.find (key);
+                if (sit == seen_candidates.end ()) {
+                  seen_candidates[key] = loc.level;
+                }
+                /* loc.level is the same for every corner of this leaf, so
+                 * no need to update. */
+              }
+            }
+          }
+    }
+  }
+
+  if (seen_candidates.empty ()) return -1;
+  int max_level = -1;
+  for (const auto &kv : seen_candidates) {
+    if (kv.second > max_level) max_level = kv.second;
+  }
+  return max_level;
+}
+
 int
 t8_forest_leaf_face_neighbors_count (t8_forest_t forest, t8_locidx_t ltreeid, const t8_element_t *leaf, int face)
 {

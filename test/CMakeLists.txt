@@ -149,6 +149,7 @@ add_t8_cpp_test( NAME t8_gtest_bin_search_parallel                SOURCES t8_for
 add_t8_cpp_test( NAME t8_gtest_bin_search_cache_parallel          SOURCES t8_forest/t8_gtest_bin_search_cache.cxx t8_gtest_adapt_callbacks.cxx )
 add_t8_cpp_test( NAME t8_gtest_leaf_face_neighbors_count_parallel SOURCES t8_forest/t8_gtest_leaf_face_neighbors_count.cxx t8_gtest_adapt_callbacks.cxx )
 add_t8_cpp_test( NAME t8_gtest_leaf_periodic_neighbors_serial    SOURCES t8_forest/t8_gtest_leaf_periodic_neighbors.cxx )
+add_t8_cpp_test( NAME t8_gtest_balance_periodic_edge_serial      SOURCES t8_forest/t8_gtest_balance_periodic_edge.cxx )
 add_t8_cpp_test( NAME t8_gtest_element_volume_serial              SOURCES t8_forest/t8_gtest_element_volume.cxx )
 add_t8_cpp_test( NAME t8_gtest_search_parallel                    SOURCES t8_forest/t8_gtest_search.cxx )
 add_t8_cpp_test( NAME t8_gtest_half_neighbors_parallel            SOURCES t8_forest/t8_gtest_half_neighbors.cxx )

@@ -31,8 +31,18 @@
 #include <t8_forest/t8_forest_private.h>
 #include <t8_forest/t8_forest_ghost.h>
 #include <t8_forest/t8_forest_general.h>
+#include <t8_forest/t8_forest_periodic_cache.hxx>
 #include <t8_forest/t8_forest_profiling.h>
 #include <t8_schemes/t8_scheme.hxx>
+
+/* Path C v2: payload passed via forest->t8code_data to t8_forest_balance_adapt.
+ * Previously a bare int *. The periodic_cache field is NULL on non-periodic
+ * meshes and the callback short-circuits the periodic check in that case. */
+struct t8_forest_balance_data
+{
+  int done;
+  t8_forest_periodic_cache_t *periodic_cache;
+};
 
 /* We want to export the whole implementation to be callable from "C" */
 T8_EXTERN_C_BEGIN ();
@@ -64,11 +74,12 @@ t8_forest_balance_adapt (t8_forest_t forest, t8_forest_t forest_from, const t8_l
                          const t8_scheme *scheme, [[maybe_unused]] const int is_family,
                          [[maybe_unused]] const int num_elements, t8_element_t *elements[])
 {
-  int *pdone, iface, num_faces, num_half_neighbors, ineigh;
+  int iface, num_faces, num_half_neighbors, ineigh;
   t8_gloidx_t neighbor_tree;
   t8_eclass_t neigh_class;
   const t8_element_t *element = elements[0];
   t8_element_t **half_neighbors;
+  t8_forest_balance_data *data;
 
   /* We only need to check an element, if its level is smaller then the maximum
    * level in the forest minus 2.
@@ -77,10 +88,10 @@ t8_forest_balance_adapt (t8_forest_t forest, t8_forest_t forest_from, const t8_l
    * If we enter from the check function is_balanced, then it may not be set.
    */
 
-  if (forest_from->maxlevel_existing <= 0
-      || scheme->element_get_level (tree_class, element) <= forest_from->maxlevel_existing - 2) {
+  const int element_level = scheme->element_get_level (tree_class, element);
+  if (forest_from->maxlevel_existing <= 0 || element_level <= forest_from->maxlevel_existing - 2) {
 
-    pdone = (int *) forest->t8code_data;
+    data = (t8_forest_balance_data *) forest->t8code_data;
 
     num_faces = scheme->element_get_num_faces (tree_class, element);
     for (iface = 0; iface < num_faces; iface++) {
@@ -100,7 +111,7 @@ t8_forest_balance_adapt (t8_forest_t forest, t8_forest_t forest_from, const t8_l
         for (ineigh = 0; ineigh < num_half_neighbors; ineigh++) {
           if (t8_forest_element_has_leaf_desc (forest_from, neighbor_tree, half_neighbors[ineigh], neigh_class)) {
             /* This element should be refined */
-            *pdone = 0;
+            data->done = 0;
             /* clean-up */
             scheme->element_destroy (neigh_class, num_half_neighbors, half_neighbors);
             T8_FREE (half_neighbors);
@@ -111,6 +122,21 @@ t8_forest_balance_adapt (t8_forest_t forest, t8_forest_t forest_from, const t8_l
       /* clean-up */
       scheme->element_destroy (neigh_class, num_half_neighbors, half_neighbors);
       T8_FREE (half_neighbors);
+    }
+
+    /* Path C v2: periodic edge/vertex 2:1 check. If the forest has periodic
+     * boundary joins (data->periodic_cache != nullptr), look up the maximum
+     * level among all periodic-adjacency neighbors of this element. If any
+     * exceeds element_level + 1, the element must refine. Symmetric — each
+     * leaf only refines itself, never marks neighbors. The cache is rebuilt
+     * once per balance round, so per-leaf lookups are cheap. */
+    if (data->periodic_cache != nullptr) {
+      const int max_pn_level
+        = t8_forest_periodic_cache_max_neighbor_level (data->periodic_cache, forest_from, ltree_id, element);
+      if (max_pn_level > element_level + 1) {
+        data->done = 0;
+        return 1;
+      }
     }
   }
 
@@ -150,7 +176,8 @@ void
 t8_forest_balance (t8_forest_t forest, int repartition)
 {
   t8_forest_t forest_temp, forest_from, forest_partition;
-  int done = 0, done_global = 0;
+  t8_forest_balance_data balance_data;
+  int done_global = 0;
   int count_rounds = 0;
   /* The following variables are only required if profiling is
    * enabled. */
@@ -197,8 +224,15 @@ t8_forest_balance (t8_forest_t forest, int repartition)
     t8_forest_ghost_create_topdown (forest->set_from);
   }
 
+  /* Path C v2: build periodic-adjacency cache against the initial forest.
+   * Returns nullptr if the cmesh has no periodic face-pair joins, in which
+   * case the adapt callback short-circuits the periodic check. The cache
+   * is rebuilt inside the loop because forest_from changes each round. */
+  balance_data.done = 1;
+  balance_data.periodic_cache = t8_forest_periodic_cache_new (forest_from);
+
   while (!done_global) {
-    done = 1;
+    balance_data.done = 1;
 
     T8_ASSERT (forest_from->maxlevel_existing >= 0);
     /* Initialize the temp forest to be adapted from forest_from */
@@ -210,7 +244,7 @@ t8_forest_balance (t8_forest_t forest, int repartition)
     if (!repartition) {
       t8_forest_set_ghost (forest_temp, 1, T8_GHOST_FACES);
     }
-    forest_temp->t8code_data = &done;
+    forest_temp->t8code_data = &balance_data;
     /* If profiling is enabled, measure ghost/adapt runtimes */
     if (forest->profile != NULL) {
       t8_forest_set_profiling (forest_temp, 1);
@@ -243,7 +277,7 @@ t8_forest_balance (t8_forest_t forest, int repartition)
 
     /* Compute the logical and of all process local done values, if this results
      * in 1 then all processes are finished */
-    sc_MPI_Allreduce (&done, &done_global, 1, sc_MPI_INT, sc_MPI_LAND, forest->mpicomm);
+    sc_MPI_Allreduce (&balance_data.done, &done_global, 1, sc_MPI_INT, sc_MPI_LAND, forest->mpicomm);
 
     if (repartition && !done_global) {
       /* If repartitioning is used, we partition the forest */
@@ -274,7 +308,21 @@ t8_forest_balance (t8_forest_t forest, int repartition)
     /* Adapt forest_temp in the next round */
     forest_from = forest_temp;
     count_rounds++;
+
+    /* Path C v2: if there's more balancing to do and the cmesh is periodic,
+     * rebuild the periodic-adjacency cache against the new forest_from for
+     * the next round. (Leaf indices change after adapt, so the prior cache
+     * is stale.) */
+    if (!done_global && balance_data.periodic_cache != nullptr) {
+      t8_forest_periodic_cache_destroy (balance_data.periodic_cache);
+      balance_data.periodic_cache = t8_forest_periodic_cache_new (forest_from);
+    }
   }
+
+  /* Path C v2: tear down the cache before the post-balance assertion. The
+   * assertion calls t8_forest_is_balanced which builds its OWN cache. */
+  t8_forest_periodic_cache_destroy (balance_data.periodic_cache);
+  balance_data.periodic_cache = nullptr;
 
   T8_ASSERT (t8_forest_is_balanced (forest_temp));
   /* Forest_temp is now balanced, we copy its trees and elements to forest */
@@ -340,7 +388,7 @@ t8_forest_is_balanced (t8_forest_t forest)
   t8_locidx_t num_trees, num_elements;
   t8_locidx_t itree, ielem;
   void *data_temp;
-  int dummy_int;
+  t8_forest_balance_data dummy_data;
 
   T8_ASSERT (t8_forest_is_committed (forest));
   const t8_scheme *scheme = t8_forest_get_scheme (forest);
@@ -352,7 +400,11 @@ t8_forest_is_balanced (t8_forest_t forest)
 
   /* temporarily save forest t8code_data */
   data_temp = forest->t8code_data;
-  forest->t8code_data = &dummy_int;
+  /* Path C v2: extended payload — also build a periodic cache so the
+   * post-balance check honors the same 2:1 rule that the loop enforced. */
+  dummy_data.done = 1;
+  dummy_data.periodic_cache = t8_forest_periodic_cache_new (forest);
+  forest->t8code_data = &dummy_data;
 
   num_trees = t8_forest_get_num_local_trees (forest);
   /* Iterate over all trees */
@@ -366,12 +418,14 @@ t8_forest_is_balanced (t8_forest_t forest)
        * If so, the forest is not balanced locally. */
       if (t8_forest_balance_adapt (forest, forest, itree, tree_class, ielem, scheme, 0, 1,
                                    (t8_element_t **) (&element))) {
+        t8_forest_periodic_cache_destroy (dummy_data.periodic_cache);
         forest->set_from = forest_from;
         forest->t8code_data = data_temp;
         return 0;
       }
     }
   }
+  t8_forest_periodic_cache_destroy (dummy_data.periodic_cache);
   forest->set_from = forest_from;
   forest->t8code_data = data_temp;
   return 1;
