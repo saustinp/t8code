@@ -48,6 +48,7 @@
 #include <t8_forest/t8_forest_general.h>
 #include <t8_forest/t8_forest_geometrical.h>
 #include <t8_forest/t8_forest_balance.h>
+#include <t8_forest/t8_forest_periodic_cache.hxx>
 #include <t8_schemes/t8_default/t8_default.hxx>
 #include <t8_schemes/t8_scheme.hxx>
 
@@ -303,4 +304,145 @@ TEST_F (BalancePeriodicEdgeReplicated, post_balance_periodic_2to1_holds)
 TEST_F (BalancePeriodicEdgeReplicated, post_balance_face_2to1_holds)
 {
   EXPECT_TRUE (t8_forest_is_balanced (forest)) << "Forest reports not-balanced after t8_forest_balance.";
+}
+
+/* ------------------------------------------------------------------ */
+/* Distributed multi-rank gate (B2, 2026-06-02):                      */
+/*                                                                    */
+/* Builds the forest on MPI_COMM_WORLD with a replicated cmesh and    */
+/* default uniform partition — every rank owns a slice of the global  */
+/* leaf set. At NP=1 this is identical to BalancePeriodicEdge. At     */
+/* NP>1 it exercises the B2 Allgatherv path in                        */
+/* t8_forest_periodic_cache_new: each rank gathers on-periodic-seam   */
+/* corners from every other rank so the periodic-balance contract     */
+/* holds globally.                                                    */
+/*                                                                    */
+/* Gate: t8_forest_is_balanced + the explicit "balance-aware periodic */
+/* 2:1 across leaves visible on this rank" check. The latter only     */
+/* sees local leaves on each rank, but the union of local-leaf checks */
+/* across ranks covers every leaf — and every local-leaf check uses   */
+/* the (now globally-complete) periodic-neighbor query.               */
+/* ------------------------------------------------------------------ */
+class BalancePeriodicEdgeDistributed : public ::testing::Test {
+ protected:
+  void
+  SetUp () override
+  {
+    scheme = t8_scheme_new_default ();
+    /* COMM_WORLD + replicated cmesh: t8_forest_new_uniform SFC-partitions
+     * the leaves across the comm so each rank owns local_num < global_num
+     * (when comm size > 1). This is the load-bearing case for B2: the
+     * periodic-cache build path that requires Allgatherv on on-seam
+     * corners. */
+    t8_cmesh_t cmesh = t8_cmesh_new_hypercube (T8_ECLASS_TET, sc_MPI_COMM_WORLD,
+                                               /*do_bcast=*/0, /*do_partition=*/0,
+                                               /*periodic=*/1);
+    ASSERT_NE (cmesh, nullptr);
+    t8_forest_t uniform_forest
+      = t8_forest_new_uniform (cmesh, scheme, /*level=*/1, /*do_face_ghost=*/1, sc_MPI_COMM_WORLD);
+    ASSERT_NE (uniform_forest, nullptr);
+
+    t8_forest_t adapted_forest;
+    t8_forest_init (&adapted_forest);
+    t8_forest_set_adapt (adapted_forest, uniform_forest, adapt_refine_tree0_to_level3, /*recursive=*/1);
+    t8_forest_set_ghost (adapted_forest, 1, T8_GHOST_FACES);
+    t8_forest_commit (adapted_forest);
+
+    t8_forest_t balanced_forest;
+    t8_forest_init (&balanced_forest);
+    t8_forest_set_balance (balanced_forest, adapted_forest, /*no_repartition=*/1);
+    t8_forest_set_ghost (balanced_forest, 1, T8_GHOST_FACES);
+    t8_forest_commit (balanced_forest);
+
+    forest = balanced_forest;
+    ASSERT_NE (forest, nullptr);
+  }
+
+  void
+  TearDown () override
+  {
+    if (forest != nullptr) {
+      t8_forest_unref (&forest);
+    }
+  }
+
+  const t8_scheme *scheme = nullptr;
+  t8_forest_t forest = nullptr;
+};
+
+/* Post-balance face-balance contract holds on every rank. */
+TEST_F (BalancePeriodicEdgeDistributed, post_balance_face_2to1_holds)
+{
+  EXPECT_TRUE (t8_forest_is_balanced (forest)) << "Forest reports not-balanced after t8_forest_balance.";
+}
+
+/* Post-balance periodic-edge/vertex 2:1 contract holds on every rank.
+ *
+ * Per-rank check: every locally-owned leaf is queried against the
+ * periodic-adjacency cache (the same machinery that t8_forest_balance
+ * uses internally). At NP>1 distributed forests, the cache build path
+ * does an Allgatherv on on-seam corners so every rank's hash is
+ * globally complete — that's exactly the B2 invariant under test.
+ *
+ * Why not t8_forest_leaf_periodic_neighbors (the v1 query)? v1 emits
+ * incidence records that carry a copy of the neighbor element. For
+ * cross-rank periodic partners we don't own the remote element handle,
+ * so v1's record format isn't representable at NP>1 distributed without
+ * a public-API extension. Extending the v1 query to distributed
+ * forests is a follow-up to B2; for now the gate that matters (and
+ * that drives the balance algorithm) is the cache query. */
+TEST_F (BalancePeriodicEdgeDistributed, post_balance_periodic_2to1_holds)
+{
+  const t8_scheme *fscheme = t8_forest_get_scheme (forest);
+  const t8_locidx_t n_trees = t8_forest_get_num_local_trees (forest);
+
+  /* Build the periodic-adjacency cache against the post-balance forest.
+   * COLLECTIVE on COMM_WORLD: every rank must call together. */
+  t8_forest_periodic_cache_t *cache = t8_forest_periodic_cache_new (forest);
+  ASSERT_NE (cache, nullptr) << "Periodic-adjacency cache build returned NULL — "
+                                "the periodic Kuhn cube has periodic joins, so "
+                                "this is a regression.";
+
+  int local_violations = 0;
+  int local_n_pairs = 0;
+
+  for (t8_locidx_t lt = 0; lt < n_trees; ++lt) {
+    const t8_eclass_t lt_class = t8_forest_get_tree_class (forest, lt);
+    const t8_locidx_t n_leaves = t8_forest_get_tree_num_leaf_elements (forest, lt);
+    for (t8_locidx_t le = 0; le < n_leaves; ++le) {
+      const t8_element_t *leaf = t8_forest_get_leaf_element_in_tree (forest, lt, le);
+      const int my_level = fscheme->element_get_level (lt_class, leaf);
+
+      const int max_n_level = t8_forest_periodic_cache_max_neighbor_level (cache, forest, lt, leaf);
+      if (max_n_level < 0) continue; /* this leaf has no periodic incidences */
+
+      ++local_n_pairs; /* one "pair-set" per leaf; counts leaves with periodic neighbors */
+      const int diff = std::abs (my_level - max_n_level);
+      if (diff > 1) {
+        if (local_violations < 8) {
+          ADD_FAILURE () << "Periodic-adjacency 2:1 violated (distributed): leaf (tree=" << lt
+                         << ", leid=" << le << ", level=" << my_level
+                         << ") max periodic-neighbor level " << max_n_level << " (diff=" << diff << ")";
+        }
+        ++local_violations;
+      }
+    }
+  }
+
+  t8_forest_periodic_cache_destroy (cache);
+
+  /* Allreduce-style global predicates: any rank seeing a violation fails
+   * the global gate; any rank seeing zero pairs is OK only if every rank
+   * sees zero (degenerate test). */
+  int global_violations = 0;
+  int global_n_pairs = 0;
+  ASSERT_EQ (sc_MPI_Allreduce (&local_violations, &global_violations, 1, sc_MPI_INT, sc_MPI_SUM, sc_MPI_COMM_WORLD),
+             sc_MPI_SUCCESS);
+  ASSERT_EQ (sc_MPI_Allreduce (&local_n_pairs, &global_n_pairs, 1, sc_MPI_INT, sc_MPI_SUM, sc_MPI_COMM_WORLD),
+             sc_MPI_SUCCESS);
+
+  EXPECT_GT (global_n_pairs, 0) << "Test setup is degenerate: no leaves with periodic incidences found across any rank.";
+  EXPECT_EQ (global_violations, 0) << "Found " << global_violations
+                                   << " global periodic-adjacency 2:1 violations across "
+                                   << global_n_pairs << " leaves with periodic neighbors.";
 }

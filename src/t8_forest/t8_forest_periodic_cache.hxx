@@ -51,8 +51,19 @@ typedef struct t8_forest_periodic_cache t8_forest_periodic_cache_t;
 /** Build a periodic-adjacency cache for \a forest. Returns NULL if the
  * forest's cmesh has no periodic face-pair joins (i.e. no periodicity at
  * all in the mesh). Caller owns the returned cache and must destroy with
- * \ref t8_forest_periodic_cache_destroy. Single-rank only for v2; asserts
- * if \a forest->mpisize > 1. */
+ * \ref t8_forest_periodic_cache_destroy.
+ *
+ * Multi-rank handling:
+ *   - Replicated forest (mpisize==1, or local_num_leaves == global_num_leaves):
+ *     every rank builds the hash from its own (full) leaf set.
+ *   - Distributed forest (mpisize>1 and local_num != global_num): each rank
+ *     first inserts its local leaves, then exchanges on-periodic-seam corners
+ *     (Allgatherv on (xyz, level) records). Remote corners are stored as
+ *     PCacheLoc with ltreeid=-1 so the consumer treats them as "trust the
+ *     cached level, do not dereference an element handle".
+ *
+ * The function is COLLECTIVE on \a forest's MPI communicator at NP>1: every
+ * rank must call it together. */
 t8_forest_periodic_cache_t *
 t8_forest_periodic_cache_new (t8_forest_t forest);
 

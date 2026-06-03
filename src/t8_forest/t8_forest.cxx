@@ -2285,10 +2285,20 @@ struct PCacheKeyHash
 };
 struct PCacheLoc
 {
+  /* For LOCAL entries (this rank owns the leaf), ltreeid >= 0 and the
+   * (ltreeid, leid, corner) triple is meaningful and can be used to fetch
+   * the actual element via t8_forest_get_leaf_element_in_tree.
+   *
+   * For REMOTE entries (gathered from another rank via Allgatherv on
+   * distributed forests), ltreeid == -1 and the (leid, corner) fields are
+   * sentinel — the consumer must use xyz + level only, and skip any
+   * element-handle dereference. */
   t8_locidx_t ltreeid;
   t8_locidx_t leid;
   int8_t corner;
   int8_t level; /* cached so the max-level query doesn't need a re-fetch */
+  double xyz[3]; /* cached physical corner position so the consumer can
+                  * re-verify hash hits without an element dereference */
 };
 }  // namespace
 
@@ -2308,28 +2318,23 @@ t8_forest_periodic_cache_new (t8_forest_t forest)
 {
   T8_ASSERT (t8_forest_is_committed (forest));
 
-  /* Path C v2: distributed multi-rank support is a follow-up. For REPLICATED
-   * forests at mpisize>1 (every rank holds the full leaf set), the cache works
-   * as-is: each rank's local corner hash IS the global hash since the leaves
-   * are replicated. For PARTITIONED (distributed) forests we return NULL so
-   * balance silently falls back to face-only — adding cross-rank Allgatherv on
-   * on-seam corners is tracked under B2 in the frozen distributed plan
-   * (notes/PLAN_DISTRIBUTED_MULTIRANK_FROZEN_2026_05_31.md in amr_dev).
+  /* Path C v2 multi-rank handling.
    *
-   * Replicated detection: a forest is replicated iff every rank's local leaf
-   * count equals the global leaf count. This is the load-bearing predicate
-   * (not t8_cmesh_is_partitioned alone — a replicated cmesh can still feed a
-   * distributed forest if comm size > 1 in t8_forest_new_uniform). */
-  if (forest->mpisize > 1) {
-    const t8_gloidx_t global_num
-      = t8_forest_get_global_num_leaf_elements (forest);
-    const t8_locidx_t local_num
-      = t8_forest_get_local_num_leaf_elements (forest);
-    if (static_cast<t8_gloidx_t> (local_num) != global_num) {
-      /* Distributed forest — deferred. */
-      return nullptr;
-    }
-  }
+   *   - REPLICATED (mpisize==1 or local_num==global_num): the per-rank corner
+   *     hash IS the global hash since every rank holds every leaf. Build the
+   *     hash from local trees and we're done.
+   *
+   *   - DISTRIBUTED (mpisize>1 and local_num<global_num): each rank only owns
+   *     a slice of the leaves. To make the periodic-neighbor query globally
+   *     correct, every rank must additionally see the on-seam corners of
+   *     leaves owned by other ranks. We do this via Allgatherv of (xyz, level)
+   *     records below — see Step 3 (after the corner hash is built from local
+   *     leaves). The Allgatherv branch is gated on
+   *     (forest->mpisize > 1 && local_num != global_num); the replicated
+   *     branch skips it entirely. */
+  const t8_gloidx_t global_num = t8_forest_get_global_num_leaf_elements (forest);
+  const t8_locidx_t local_num = t8_forest_get_local_num_leaf_elements (forest);
+  const bool is_distributed = (forest->mpisize > 1) && (static_cast<t8_gloidx_t> (local_num) != global_num);
 
   const double tol = 10.0 * T8_PRECISION_EPS;
   const t8_cmesh_t cmesh = t8_forest_get_cmesh (forest);
@@ -2382,8 +2387,77 @@ t8_forest_periodic_cache_new (t8_forest_t forest)
     }
   }
 
-  if (n_translations == 0) {
-    return nullptr; /* mesh is not periodic; caller short-circuits */
+  /* For distributed forests with a (potentially) partitioned cmesh, the local
+   * cmesh slice may contain none of the periodic joins (they all live on
+   * other ranks). To decide whether the mesh is periodic at all, take the
+   * collective max of local n_translations. If the global max is 0, no rank
+   * has a periodic join → short-circuit collectively. If non-zero, every rank
+   * must enter the Allgatherv below (collective) even when its local
+   * n_translations is 0; we promote the local count to the global max by
+   * importing translations from other ranks. */
+  int has_any_translation = (n_translations > 0) ? 1 : 0;
+  if (is_distributed) {
+    sc_MPI_Comm comm = t8_forest_get_mpicomm (forest);
+    int global_any = 0;
+    int mpiret = sc_MPI_Allreduce (&has_any_translation, &global_any, 1, sc_MPI_INT, sc_MPI_MAX, comm);
+    SC_CHECK_MPI (mpiret);
+    has_any_translation = global_any;
+  }
+  if (!has_any_translation) {
+    return nullptr; /* mesh is not periodic (globally); caller short-circuits */
+  }
+
+  /* If this rank has no local translations but another rank does, collect the
+   * full translation set via Allreduce-style exchange. We do this with a
+   * fixed-size Allgather of (n_translations, translations[MAX][3]) so every
+   * rank ends up with the same translation table. */
+  if (is_distributed) {
+    sc_MPI_Comm comm = t8_forest_get_mpicomm (forest);
+    /* Allgather per-rank (count, translations). The buffer per rank is
+     * MAX_TRANSLATIONS*3+1 doubles (count packed as a double for buffer
+     * homogeneity). */
+    const int per_rank = t8_forest_periodic_cache::MAX_TRANSLATIONS * 3 + 1;
+    std::vector<double> sendbuf ((size_t) per_rank, 0.0);
+    sendbuf[0] = (double) n_translations;
+    for (int t = 0; t < n_translations; ++t) {
+      sendbuf[1 + t * 3 + 0] = translations[t][0];
+      sendbuf[1 + t * 3 + 1] = translations[t][1];
+      sendbuf[1 + t * 3 + 2] = translations[t][2];
+    }
+    std::vector<double> recvbuf ((size_t) per_rank * (size_t) forest->mpisize, 0.0);
+    int mpiret
+      = sc_MPI_Allgather (sendbuf.data (), per_rank, sc_MPI_DOUBLE, recvbuf.data (), per_rank, sc_MPI_DOUBLE, comm);
+    SC_CHECK_MPI (mpiret);
+    /* Merge translations: union, dedup against existing entries by tol. */
+    for (int r = 0; r < forest->mpisize; ++r) {
+      const int rcount = (int) recvbuf[r * per_rank + 0];
+      for (int t = 0; t < rcount; ++t) {
+        const double dx = recvbuf[r * per_rank + 1 + t * 3 + 0];
+        const double dy = recvbuf[r * per_rank + 1 + t * 3 + 1];
+        const double dz = recvbuf[r * per_rank + 1 + t * 3 + 2];
+        int dup = 0;
+        for (int u = 0; u < n_translations; ++u) {
+          const double ddx = dx - translations[u][0];
+          const double ddy = dy - translations[u][1];
+          const double ddz = dz - translations[u][2];
+          if (ddx * ddx + ddy * ddy + ddz * ddz < tol * tol) {
+            dup = 1;
+            break;
+          }
+        }
+        if (dup) continue;
+        if (n_translations >= t8_forest_periodic_cache::MAX_TRANSLATIONS) {
+          SC_ABORTF ("t8_forest_periodic_cache_new: too many unique periodic "
+                     "translations after Allgather merge (>%d).\n",
+                     t8_forest_periodic_cache::MAX_TRANSLATIONS);
+        }
+        translations[n_translations][0] = dx;
+        translations[n_translations][1] = dy;
+        translations[n_translations][2] = dz;
+        ++n_translations;
+      }
+    }
+    T8_ASSERT (n_translations > 0);
   }
 
   t8_forest_periodic_cache_t *cache = new t8_forest_periodic_cache;
@@ -2397,8 +2471,8 @@ t8_forest_periodic_cache_new (t8_forest_t forest)
   cache->tol = tol;
 
   /* --- 2. Build the corner spatial hash over all leaves. We also cache the
-   *        per-leaf element level so the per-query path doesn't need to
-   *        re-fetch elements + call element_get_level. */
+   *        per-leaf element level + the corner physical position so the
+   *        per-query path doesn't need to re-fetch elements. */
   auto quantize = [&] (const double xyz[3]) {
     PCacheKey k;
     k.qx = (int64_t) std::floor (xyz[0] / cache->bucket + 0.5);
@@ -2408,6 +2482,99 @@ t8_forest_periodic_cache_new (t8_forest_t forest)
   };
   cache->corner_hash.reserve (1024);
 
+  /* --- 2a. Precompute per-local-cmesh-tree periodic-face planes. A "periodic
+   *         face plane" is the (centroid, normal) of any cmesh tree-face that
+   *         participates in a periodic join (i.e. its face-pair partner's
+   *         centroid differs by one of the global translations). A leaf
+   *         corner is "on-seam" iff its position lies within tol of any of
+   *         these planes. For the distributed Allgatherv we send only
+   *         on-seam corners — that bounds the traffic to a 2D surface of the
+   *         domain rather than the full 3D leaf set. --- */
+  struct PeriodicFacePlane
+  {
+    double centroid[3];
+    double normal[3]; /* unit-length if non-degenerate; zero-length flags "skip" */
+  };
+  std::vector<std::vector<PeriodicFacePlane>> per_tree_periodic_planes;
+  if (is_distributed) {
+    per_tree_periodic_planes.resize (n_local_trees_cmesh);
+    for (t8_locidx_t tree = 0; tree < n_local_trees_cmesh; ++tree) {
+      const t8_eclass_t tree_eclass = t8_cmesh_get_tree_class (cmesh, tree);
+      const int n_faces = t8_eclass_num_faces[tree_eclass];
+      const double *tree_verts = t8_cmesh_get_tree_vertices (cmesh, tree);
+      for (int face = 0; face < n_faces; ++face) {
+        int dual_face, orient;
+        const t8_locidx_t neigh_tree = t8_cmesh_get_face_neighbor (cmesh, tree, face, &dual_face, &orient);
+        if (neigh_tree < 0) continue; /* genuine boundary */
+        double src_centroid[3], neigh_centroid[3];
+        t8_forest_periodic_face_centroid (cmesh, tree, face, src_centroid);
+        t8_forest_periodic_face_centroid (cmesh, neigh_tree, dual_face, neigh_centroid);
+        const double dx = neigh_centroid[0] - src_centroid[0];
+        const double dy = neigh_centroid[1] - src_centroid[1];
+        const double dz = neigh_centroid[2] - src_centroid[2];
+        if (dx * dx + dy * dy + dz * dz < tol * tol) continue; /* interior, not periodic */
+        /* Compute the face normal from the first 2 (2D) or 3 (3D) face verts. */
+        const int n_face_verts = t8_forest_periodic_num_face_vertices (tree_eclass, face);
+        PeriodicFacePlane plane;
+        plane.centroid[0] = src_centroid[0];
+        plane.centroid[1] = src_centroid[1];
+        plane.centroid[2] = src_centroid[2];
+        plane.normal[0] = plane.normal[1] = plane.normal[2] = 0.0;
+        if (n_face_verts >= 2) {
+          const int tv0 = t8_face_vertex_to_tree_vertex[tree_eclass][face][0];
+          const int tv1 = t8_face_vertex_to_tree_vertex[tree_eclass][face][1];
+          const double e1[3] = { tree_verts[tv1 * 3 + 0] - tree_verts[tv0 * 3 + 0],
+                                 tree_verts[tv1 * 3 + 1] - tree_verts[tv0 * 3 + 1],
+                                 tree_verts[tv1 * 3 + 2] - tree_verts[tv0 * 3 + 2] };
+          double nx, ny, nz;
+          if (n_face_verts >= 3) {
+            const int tv2 = t8_face_vertex_to_tree_vertex[tree_eclass][face][2];
+            const double e2[3] = { tree_verts[tv2 * 3 + 0] - tree_verts[tv0 * 3 + 0],
+                                   tree_verts[tv2 * 3 + 1] - tree_verts[tv0 * 3 + 1],
+                                   tree_verts[tv2 * 3 + 2] - tree_verts[tv0 * 3 + 2] };
+            nx = e1[1] * e2[2] - e1[2] * e2[1];
+            ny = e1[2] * e2[0] - e1[0] * e2[2];
+            nz = e1[0] * e2[1] - e1[1] * e2[0];
+          }
+          else {
+            /* 2D: face is a line; normal is the in-plane perpendicular to e1 */
+            nx = -e1[1];
+            ny = e1[0];
+            nz = 0.0;
+          }
+          const double nlen = std::sqrt (nx * nx + ny * ny + nz * nz);
+          if (nlen > tol) {
+            plane.normal[0] = nx / nlen;
+            plane.normal[1] = ny / nlen;
+            plane.normal[2] = nz / nlen;
+          }
+        }
+        per_tree_periodic_planes[tree].push_back (plane);
+      }
+    }
+  }
+  auto corner_on_periodic_seam = [&] (t8_locidx_t tree, const double xyz[3]) -> bool {
+    if (tree < 0 || tree >= (t8_locidx_t) per_tree_periodic_planes.size ()) return false;
+    for (const auto &p : per_tree_periodic_planes[tree]) {
+      if (p.normal[0] == 0.0 && p.normal[1] == 0.0 && p.normal[2] == 0.0) continue;
+      const double dx = xyz[0] - p.centroid[0];
+      const double dy = xyz[1] - p.centroid[1];
+      const double dz = xyz[2] - p.centroid[2];
+      const double d = dx * p.normal[0] + dy * p.normal[1] + dz * p.normal[2];
+      if (std::fabs (d) < tol) return true;
+    }
+    return false;
+  };
+
+  /* --- 2b. Insert local-leaf corners into the hash. For distributed forests,
+   *         additionally collect on-seam corners into a send buffer for the
+   *         Allgatherv step below. --- */
+  /* Send-buffer record layout: 4 doubles per on-seam corner = (x, y, z, level).
+   * Use double for level too so the buffer is homogeneous (sc_MPI_DOUBLE). */
+  std::vector<double> send_buf;
+  if (is_distributed) {
+    send_buf.reserve (1024);
+  }
   const t8_locidx_t n_forest_trees = t8_forest_get_num_local_trees (forest);
   for (t8_locidx_t nt = 0; nt < n_forest_trees; ++nt) {
     const t8_eclass_t neigh_eclass = t8_forest_get_tree_class (forest, nt);
@@ -2420,8 +2587,81 @@ t8_forest_periodic_cache_new (t8_forest_t forest)
       for (int c = 0; c < n_neigh_corners; ++c) {
         double xyz[3];
         t8_forest_element_coordinate (forest, nt, neigh_leaf, c, xyz);
-        cache->corner_hash[quantize (xyz)].push_back (
-          PCacheLoc { nt, leid, (int8_t) c, (int8_t) level });
+        PCacheLoc loc;
+        loc.ltreeid = nt;
+        loc.leid = leid;
+        loc.corner = (int8_t) c;
+        loc.level = (int8_t) level;
+        loc.xyz[0] = xyz[0];
+        loc.xyz[1] = xyz[1];
+        loc.xyz[2] = xyz[2];
+        cache->corner_hash[quantize (xyz)].push_back (loc);
+        if (is_distributed && corner_on_periodic_seam (nt, xyz)) {
+          send_buf.push_back (xyz[0]);
+          send_buf.push_back (xyz[1]);
+          send_buf.push_back (xyz[2]);
+          send_buf.push_back ((double) level);
+        }
+      }
+    }
+  }
+
+  /* --- 3. Distributed Allgatherv of on-seam corners. Each rank sends its
+   *        on-seam corner records (xyz + level), receives every other rank's
+   *        records, and inserts them as REMOTE entries (PCacheLoc with
+   *        ltreeid == -1) into the same corner hash. The max-neighbor-level
+   *        consumer treats remote entries as "trust the cached level, do not
+   *        dereference the element handle". --- */
+  if (is_distributed) {
+    sc_MPI_Comm comm = t8_forest_get_mpicomm (forest);
+    const int mpisize = forest->mpisize;
+    const int mpirank = forest->mpirank;
+    /* sc_MPI_Allgatherv takes int counts, so the on-seam corner count per rank
+     * must fit in int. At production scale (~115K leaves with on-seam ≤ ~2000)
+     * the bound holds; we add an assert for safety. */
+    T8_ASSERT (send_buf.size () <= (size_t) INT_MAX);
+    const int sendcount = (int) send_buf.size ();
+    std::vector<int> recvcounts (mpisize, 0);
+    int mpiret
+      = sc_MPI_Allgather ((void *) &sendcount, 1, sc_MPI_INT, recvcounts.data (), 1, sc_MPI_INT, comm);
+    SC_CHECK_MPI (mpiret);
+    std::vector<int> displs (mpisize, 0);
+    long long total = 0;
+    for (int r = 0; r < mpisize; ++r) {
+      displs[r] = (int) total;
+      total += recvcounts[r];
+    }
+    SC_CHECK_ABORT (total <= (long long) INT_MAX,
+                    "t8_forest_periodic_cache_new: aggregate on-seam corner buffer "
+                    "exceeds INT_MAX doubles; raise to a paged Allgatherv if you "
+                    "hit this at scale.\n");
+    std::vector<double> recv_buf ((size_t) total);
+    if (total > 0) {
+      mpiret = sc_MPI_Allgatherv (sendcount > 0 ? send_buf.data () : nullptr, sendcount, sc_MPI_DOUBLE,
+                                  recv_buf.data (), recvcounts.data (), displs.data (), sc_MPI_DOUBLE, comm);
+      SC_CHECK_MPI (mpiret);
+    }
+    /* Insert OTHER ranks' records as remote entries. Skip our own slice (we
+     * already inserted those above as local entries). */
+    for (int r = 0; r < mpisize; ++r) {
+      if (r == mpirank) continue;
+      const int start = displs[r];
+      const int cnt = recvcounts[r];
+      for (int k = 0; k < cnt; k += 4) {
+        const double x = recv_buf[start + k + 0];
+        const double y = recv_buf[start + k + 1];
+        const double z = recv_buf[start + k + 2];
+        const int level = (int) recv_buf[start + k + 3];
+        PCacheLoc loc;
+        loc.ltreeid = -1; /* sentinel: this is a remote-rank corner */
+        loc.leid = -1;
+        loc.corner = -1;
+        loc.level = (int8_t) level;
+        loc.xyz[0] = x;
+        loc.xyz[1] = y;
+        loc.xyz[2] = z;
+        const double xyz[3] = { x, y, z };
+        cache->corner_hash[quantize (xyz)].push_back (loc);
       }
     }
   }
@@ -2466,8 +2706,25 @@ t8_forest_periodic_cache_max_neighbor_level (t8_forest_periodic_cache_t *cache, 
     return k;
   };
 
-  std::unordered_map<int64_t, int> seen_candidates; /* key = ltreeid<<32|leid → max level */
+  /* For LOCAL entries we de-dup by (ltreeid, leid); for REMOTE entries we
+   * de-dup by the quantized (qx, qy, qz) bucket of the first matched corner
+   * — that's enough granularity since remote entries are stored without an
+   * element handle and several corners of one remote leaf may match. The
+   * remote dedup key uses the high bit (set) to avoid colliding with any
+   * possible local (ltreeid, leid) key. */
+  std::unordered_map<int64_t, int> seen_candidates;
   seen_candidates.reserve (16);
+  auto remote_dedup_key = [&] (const PCacheLoc &loc) -> int64_t {
+    /* Pack quantized position into an int64 with a high-bit tag. The bucket
+     * width matches cache->bucket so corners of the same remote leaf collide
+     * to the same key. */
+    const int64_t qx = (int64_t) std::floor (loc.xyz[0] / cache->bucket + 0.5);
+    const int64_t qy = (int64_t) std::floor (loc.xyz[1] / cache->bucket + 0.5);
+    const int64_t qz = (int64_t) std::floor (loc.xyz[2] / cache->bucket + 0.5);
+    /* Mix into a single 63-bit key; top bit is the "remote" tag. */
+    int64_t k = (qx * 73856093) ^ (qy * 19349663) ^ (qz * 83492791);
+    return k | ((int64_t) 1 << 62);
+  };
 
   for (int t = 0; t < cache->n_translations; ++t) {
     const double *T = cache->translations[t];
@@ -2481,22 +2738,26 @@ t8_forest_periodic_cache_max_neighbor_level (t8_forest_periodic_cache_t *cache, 
             auto it = cache->corner_hash.find (kp);
             if (it == cache->corner_hash.end ()) continue;
             for (const auto &loc : it->second) {
-              /* Skip the source leaf itself. */
-              if (loc.ltreeid == ltreeid) {
-                const t8_element_t *cand
-                  = t8_forest_get_leaf_element_in_tree (forest, loc.ltreeid, loc.leid);
-                if (scheme->element_is_equal (leaf_eclass, leaf, cand)) continue;
+              if (loc.ltreeid >= 0) {
+                /* LOCAL entry. Skip the source leaf itself. */
+                if (loc.ltreeid == ltreeid) {
+                  const t8_element_t *cand
+                    = t8_forest_get_leaf_element_in_tree (forest, loc.ltreeid, loc.leid);
+                  if (scheme->element_is_equal (leaf_eclass, leaf, cand)) continue;
+                }
               }
-              /* Verify the actual coord (hash bucket isn't conclusive). */
-              const t8_element_t *cand_leaf
-                = t8_forest_get_leaf_element_in_tree (forest, loc.ltreeid, loc.leid);
-              double cand_xyz[3];
-              t8_forest_element_coordinate (forest, loc.ltreeid, cand_leaf, loc.corner, cand_xyz);
-              const double ddx = mirror[0] - cand_xyz[0];
-              const double ddy = mirror[1] - cand_xyz[1];
-              const double ddz = mirror[2] - cand_xyz[2];
+              /* Verify the actual coord (hash bucket isn't conclusive). For
+               * local entries we trust the cached loc.xyz (populated at build
+               * time, equivalent to re-fetching via element_coordinate). For
+               * remote entries we have no choice — loc.xyz is all we have. */
+              const double ddx = mirror[0] - loc.xyz[0];
+              const double ddy = mirror[1] - loc.xyz[1];
+              const double ddz = mirror[2] - loc.xyz[2];
               if (ddx * ddx + ddy * ddy + ddz * ddz < cache->tol * cache->tol) {
-                const int64_t key = ((int64_t) loc.ltreeid << 32) | (uint32_t) loc.leid;
+                const int64_t key
+                  = (loc.ltreeid >= 0)
+                      ? (((int64_t) loc.ltreeid << 32) | (uint32_t) loc.leid)
+                      : remote_dedup_key (loc);
                 auto sit = seen_candidates.find (key);
                 if (sit == seen_candidates.end ()) {
                   seen_candidates[key] = loc.level;
